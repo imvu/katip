@@ -1,3 +1,4 @@
+{-# LANGUAGE BangPatterns  #-}
 {-# LANGUAGE DeriveDataTypeable  #-}
 {-# LANGUAGE OverloadedStrings   #-}
 {-# LANGUAGE RankNTypes          #-}
@@ -72,6 +73,7 @@ import           Data.Time.Calendar.WeekDate
 import           Data.Typeable
 import           Data.UUID
 import qualified Data.UUID.V4                            as UUID4
+import qualified Data.Vector                             as V
 import           Database.Bloodhound
 import           Network.HTTP.Client
 import           Network.HTTP.Types.Status
@@ -104,6 +106,7 @@ data EsScribeCfg = EsScribeCfg {
     -- enabled.
     , essIndexSettings :: IndexSettings
     , essIndexSharding :: IndexShardingPolicy
+    , essQueueSendThreshold :: QueueSendThreshold
     } deriving (Typeable)
 
 
@@ -128,9 +131,16 @@ defaultEsScribeCfg = EsScribeCfg {
     , essAnnotateTypes   = False
     , essIndexSettings   = defaultIndexSettings
     , essIndexSharding   = DailyIndexSharding
+    , essQueueSendThreshold   = SendEach
     }
 
+data QueueSendThreshold = SendEach
+                        | BulkSend !BulkSendType
+                        deriving (Typeable)
 
+data BulkSendType = SendThresholdCount !Int
+                  | SendThresholdPredicate ((Maybe (IndexName, Value)) -> [(IndexName,Value)] -> (Bool, [(IndexName, Value)]))
+                  deriving (Typeable)
 -------------------------------------------------------------------------------
 -- | How should katip store your log data?
 --
@@ -282,7 +292,9 @@ mkEsScribe cfg@EsScribeCfg {..} env ix mapping sev verb = do
         liftIO $ throwIO (CouldNotCreateMapping r2)
 
   workers <- replicateM (unEsPoolSize essPoolSize) $ async $
-    startWorker cfg env mapping q
+    case essQueueSendThreshold of
+      SendEach -> startWorker cfg env mapping q
+      BulkSend t -> startBulkWorker cfg env t mapping q
 
   _ <- async $ do
     takeMVar endSig
@@ -409,3 +421,64 @@ startWorker EsScribeCfg {..} env mapping q = go
       case fromException e of
         Just (_ :: AsyncException) -> return False
         _ -> return True
+
+startBulkWorker
+    :: EsScribeCfg
+    -> BHEnv
+    -> BulkSendType
+    -> MappingName
+    -> TBMQueue (IndexName, Value)
+    -> IO ()
+startBulkWorker EsScribeCfg {..} env bulkType mapping q = go
+  where
+    go = do
+      let popAction = atomically $ readTBMQueue q
+          popPred = mkSendPredicate bulkType
+      popped <- unfoldWhileM popPred popAction []
+      case popped of
+        [] -> return ()
+        _ -> do
+          let bulkOp ixn v = mkDocId >>= \did -> return $ BulkIndex ixn mapping did v
+          bulkOps <- V.fromList <$> mapM (\(ixn, v) -> bulkOp ixn v) popped
+          sendLog bulkOps `catchAny` eat
+          go
+    sendLog :: V.Vector BulkOperation -> IO ()
+    sendLog ops = void $ recovering essRetryPolicy [handler] $ const $ do
+      res <- runBH env $ bulk ops
+      return res
+    eat _ = return ()
+    handler _ = Handler $ \e ->
+      case fromException e of
+        Just (_ :: AsyncException) -> return False
+        _ -> return True
+
+
+mkSendPredicate
+    :: BulkSendType
+    -> Maybe (IndexName, Value)
+    -> [(IndexName, Value)]
+    -> (Bool, [(IndexName, Value)])
+mkSendPredicate (SendThresholdCount i) = go
+    where
+        go !el !ac = case el of
+            Nothing -> (False, ac)
+            Just v -> if (length ac + 1) >= i
+                then (False, v:ac)
+                else (True, v:ac)
+mkSendPredicate (SendThresholdPredicate p) = p
+
+
+unfoldWhileM
+    :: Monad m
+    => (a -> b -> (Bool, b))
+    -> m a
+    -> b
+    -> m b
+unfoldWhileM p m a = loop a
+    where
+        loop ac = do
+            x <- m
+            let (cont, res) = p x ac
+            if cont
+                then loop res
+                else return res
