@@ -156,6 +156,8 @@ data LoggingGuarantees = NoGuarantee
                        -- ^ Try to write the message to the queue once, if it fails, it fails
                        | Try !Int
                        -- ^ Try up to N times to send the message to the queue (with a small delay between messages)
+                       | TryWithPolicy !RetryPolicy
+                       -- ^ Try using a retry policy
                        | TryAll
                        -- ^ Keep trying every millisecond to queue the message.
 
@@ -335,20 +337,20 @@ mkEsScribe cfg@EsScribeCfg {..} env ix mapping sev verb = do
     itemJson' i
       | essAnnotateTypes = itemJson verb (TypeAnnotated <$> i)
       | otherwise        = itemJson verb i
-    write' q i = atomically $ tryWriteTBMQueue q (chooseIxn ix essIndexSharding i, itemJson' i)
-    writeAction q NoGuarantee i = write' q i
-    writeAction q (Try tries) i = do
-        let retryPolicy = constantDelay 1000 <> limitRetries tries
-            failed r = case r of
-                Just False -> True
-                _ -> False
-        retrying retryPolicy (const $ return . failed) $ \_ -> write' q i
-    writeAction q TryAll i = do
-        let retryPolicy = constantDelay 1000
-            failed r = case r of
-                Just False -> True
-                _ -> False
-        retrying retryPolicy (const $ return . failed) $ \_ -> write' q i
+
+    writeToQueue q i = atomically $ tryWriteTBMQueue q (chooseIxn ix essIndexSharding i, itemJson' i)
+
+    writeAction q NoGuarantee i = writeToQueue q i
+    writeAction q (Try tries) i = retryWrite (constantDelay 1000 <> limitRetries tries) q i
+    writeAction q (TryWithPolicy retryPolicy) i = retryWrite retryPolicy q i
+    writeAction q TryAll i = retryWrite (constantDelay 1000) q i
+
+    checkFailedWrite queueElem = case queueElem of
+        Just False -> True
+        _ -> False
+
+    retryWrite retryPolicy q i = retrying retryPolicy (const $ return . checkFailedWrite) $ \_ -> writeToQueue q i
+
 
 
 
