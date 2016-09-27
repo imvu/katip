@@ -153,7 +153,7 @@ data QueueSendThreshold = SendEach
 
 data BulkSendType = SendThresholdCount !Int
                   -- ^ Simple count threshold for bulk sending. Try to get up to the number of log elements to send
-                  | SendThresholdPredicate ((Maybe (IndexName, Value)) -> [(IndexName,Value)] -> (Bool, [(IndexName, Value)]))
+                  | SendThresholdPredicate (Maybe ((Maybe (IndexName, Value))) -> [(IndexName,Value)] -> (Bool, [(IndexName, Value)]))
                   -- ^ User provided predicate for how to determine when to stop accumulating log elements for bulk sending
                   deriving (Typeable)
 
@@ -472,7 +472,7 @@ startBulkWorker
 startBulkWorker EsScribeCfg {..} env bulkType mapping q = go
   where
     go = do
-      let popAction = atomically $ readTBMQueue q
+      let popAction = atomically $ tryReadTBMQueue q
           popPred = mkSendPredicate bulkType
       popped <- unfoldWhileM popPred popAction []
       case popped of
@@ -495,16 +495,17 @@ startBulkWorker EsScribeCfg {..} env bulkType mapping q = go
 
 mkSendPredicate
     :: BulkSendType
-    -> Maybe (IndexName, Value)
+    -> Maybe (Maybe (IndexName, Value))
     -> [(IndexName, Value)]
     -> (Bool, [(IndexName, Value)])
 mkSendPredicate (SendThresholdCount i) = go
     where
         go !el !ac = case el of
-            Nothing -> (False, ac)
-            Just v -> if (length ac + 1) >= i
+            Just Nothing -> (False, ac)
+            Just (Just v) -> if (length ac + 1) >= i
                 then (False, v:ac)
                 else (True, v:ac)
+            Nothing -> (False, ac)
 mkSendPredicate (SendThresholdPredicate p) = p
 
 
