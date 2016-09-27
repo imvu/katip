@@ -62,6 +62,8 @@ import           Control.Monad.STM
 import           Control.Retry                           (RetryPolicy,
                                                           exponentialBackoff,
                                                           limitRetries,
+                                                          constantDelay,
+                                                          retrying,
                                                           recovering)
 import           Data.Aeson
 import           Data.Monoid                             ((<>))
@@ -107,6 +109,9 @@ data EsScribeCfg = EsScribeCfg {
     , essIndexSettings :: IndexSettings
     , essIndexSharding :: IndexShardingPolicy
     , essQueueSendThreshold :: QueueSendThreshold
+    -- ^ Configures how logs should be batched
+    , essLoggingGuarantees :: LoggingGuarantees
+    -- ^ What kind of guarantee is made that a log message will be queued
     } deriving (Typeable)
 
 
@@ -132,15 +137,28 @@ defaultEsScribeCfg = EsScribeCfg {
     , essIndexSettings   = defaultIndexSettings
     , essIndexSharding   = DailyIndexSharding
     , essQueueSendThreshold   = SendEach
+    , essLoggingGuarantees = NoGuarantee
     }
 
 data QueueSendThreshold = SendEach
+                        -- ^ Log each elemnt using indexDocument
                         | BulkSend !BulkSendType
+                        -- ^ Use a bulk strategy when logging the document
                         deriving (Typeable)
 
 data BulkSendType = SendThresholdCount !Int
+                  -- ^ Simple count threshold for bulk sending. Try to get up to the number of log elements to send
                   | SendThresholdPredicate ((Maybe (IndexName, Value)) -> [(IndexName,Value)] -> (Bool, [(IndexName, Value)]))
+                  -- ^ User provided predicate for how to determine when to stop accumulating log elements for bulk sending
                   deriving (Typeable)
+
+data LoggingGuarantees = NoGuarantee
+                       -- ^ Try to write the message to the queue once, if it fails, it fails
+                       | Try !Int
+                       -- ^ Try up to N times to send the message to the queue (with a small delay between messages)
+                       | TryAll
+                       -- ^ Keep trying every millisecond to queue the message.
+
 -------------------------------------------------------------------------------
 -- | How should katip store your log data?
 --
@@ -304,7 +322,7 @@ mkEsScribe cfg@EsScribeCfg {..} env ix mapping sev verb = do
 
   let scribe = Scribe $ \ i ->
         when (_itemSeverity i >= sev) $
-          void $ atomically $ tryWriteTBMQueue q (chooseIxn ix essIndexSharding i, itemJson' i)
+          void $ writeAction q essLoggingGuarantees i
   let finalizer = putMVar endSig () >> takeMVar endSig
   return (scribe, finalizer)
   where
@@ -317,6 +335,21 @@ mkEsScribe cfg@EsScribeCfg {..} env ix mapping sev verb = do
     itemJson' i
       | essAnnotateTypes = itemJson verb (TypeAnnotated <$> i)
       | otherwise        = itemJson verb i
+    write' q i = atomically $ tryWriteTBMQueue q (chooseIxn ix essIndexSharding i, itemJson' i)
+    writeAction q NoGuarantee i = write' q i
+    writeAction q (Try tries) i = do
+        let retryPolicy = constantDelay 1000 <> limitRetries tries
+            failed r = case r of
+                Just False -> True
+                _ -> False
+        retrying retryPolicy (const $ return . failed) $ \_ -> write' q i
+    writeAction q TryAll i = do
+        let retryPolicy = constantDelay 1000
+            failed r = case r of
+                Just False -> True
+                _ -> False
+        retrying retryPolicy (const $ return . failed) $ \_ -> write' q i
+
 
 
 -------------------------------------------------------------------------------
