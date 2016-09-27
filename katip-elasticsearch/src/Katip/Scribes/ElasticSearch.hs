@@ -40,6 +40,11 @@ module Katip.Scribes.ElasticSearch
     , essIndexSharding
     , IndexShardingPolicy(..)
     , IndexNameSegment(..)
+    , essQueueSendThreshold
+    , QueueSendThreshold(..)
+    , BulkSendType(..)
+    , essLoggingGuarantees
+    , LoggingGuarantees(..)
     , defaultEsScribeCfg
     -- * Utilities
     , mkDocId
