@@ -47,6 +47,7 @@ module Katip.Scribes.ElasticSearch
     , LoggingGuarantees(..)
     , essShouldAdminES
     , ShouldAdminES(..)
+    , essCallback
     , defaultEsScribeCfg
     -- * Utilities
     , mkDocId
