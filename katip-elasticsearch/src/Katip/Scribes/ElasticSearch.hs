@@ -46,6 +46,7 @@ module Katip.Scribes.ElasticSearch
     , essLoggingGuarantees
     , LoggingGuarantees(..)
     , essShouldAdminES
+    , ShouldAdminES(..)
     , defaultEsScribeCfg
     -- * Utilities
     , mkDocId
@@ -118,7 +119,7 @@ data EsScribeCfg = EsScribeCfg {
     -- ^ Configures how logs should be batched
     , essLoggingGuarantees :: LoggingGuarantees
     -- ^ What kind of guarantee is made that a log message will be queued
-    , essShouldAdminES :: Bool
+    , essShouldAdminES :: ShouldAdminES
     -- ^ Whether or not the application should manage es (createIndex / update index) or if this is managed by another team
     } deriving (Typeable)
 
@@ -144,15 +145,15 @@ data EsScribeCfg = EsScribeCfg {
 --     * This application can administer elasticsearch
 defaultEsScribeCfg :: EsScribeCfg
 defaultEsScribeCfg = EsScribeCfg {
-      essRetryPolicy     = exponentialBackoff 25 <> limitRetries 5
-    , essQueueSize       = EsQueueSize 1000
-    , essPoolSize        = EsPoolSize 2
-    , essAnnotateTypes   = False
-    , essIndexSettings   = defaultIndexSettings
-    , essIndexSharding   = DailyIndexSharding
+      essRetryPolicy          = exponentialBackoff 25 <> limitRetries 5
+    , essQueueSize            = EsQueueSize 1000
+    , essPoolSize             = EsPoolSize 2
+    , essAnnotateTypes        = False
+    , essIndexSettings        = defaultIndexSettings
+    , essIndexSharding        = DailyIndexSharding
     , essQueueSendThreshold   = SendEach
-    , essLoggingGuarantees = NoGuarantee
-    , essShouldAdminES = True
+    , essLoggingGuarantees    = NoGuarantee
+    , essShouldAdminES        = AdminES
     }
 
 data QueueSendThreshold = SendEach
@@ -175,6 +176,12 @@ data LoggingGuarantees = NoGuarantee
                        -- ^ Try using a retry policy
                        | TryAll
                        -- ^ Keep trying every millisecond to queue the message.
+
+data ShouldAdminES = NoAdminES
+                   | CheckExistsNoAdminES
+                   | AdminES
+                   deriving (Typeable)
+
 
 -------------------------------------------------------------------------------
 -- | How should katip store your log data?
@@ -298,6 +305,21 @@ data EsScribeSetupError = CouldNotCreateIndex !Reply
 
 instance Exception EsScribeSetupError
 
+
+checkIndexExists
+    :: ShouldAdminES
+    -> Bool
+checkIndexExists AdminES = True
+checkIndexExists CheckExistsNoAdminES = True
+checkIndexExists NoAdminES = False
+
+shouldAdminES
+    :: ShouldAdminES
+    -> Bool
+shouldAdminES AdminES = True
+shouldAdminES CheckExistsNoAdminES = False
+shouldAdminES NoAdminES = False
+
 -------------------------------------------------------------------------------
 mkEsScribe
     :: EsScribeCfg
@@ -313,23 +335,24 @@ mkEsScribe cfg@EsScribeCfg {..} env ix mapping sev verb = do
   q <- newTBMQueueIO $ unEsQueueSize essQueueSize
   endSig <- newEmptyMVar
 
-  runBH env $ do
-    chk <- indexExists ix
-    -- note that this doesn't update settings. That's not available
-    -- through the Bloodhound API yet
-    if chk
-       then return ()
-       else if essShouldAdminES
-          then void $ do
-              r1 <- createIndex essIndexSettings ix
-              unless (statusIsSuccessful (responseStatus r1)) $
-                liftIO $ throwIO (CouldNotCreateIndex r1)
-              r2 <- if shardingEnabled
-                      then putTemplate tpl tplName
-                      else putMapping ix mapping (baseMapping mapping)
-              unless (statusIsSuccessful (responseStatus r2)) $
-                liftIO $ throwIO (CouldNotCreateMapping r2)
-          else liftIO $ throwIO IndexDoesNotExist
+  when (checkIndexExists essShouldAdminES) $
+      runBH env $ do
+        chk <- indexExists ix
+        -- note that this doesn't update settings. That's not available
+        -- through the Bloodhound API yet
+        if chk
+          then return ()
+          else if shouldAdminES essShouldAdminES
+              then void $ do
+                  r1 <- createIndex essIndexSettings ix
+                  unless (statusIsSuccessful (responseStatus r1)) $
+                    liftIO $ throwIO (CouldNotCreateIndex r1)
+                  r2 <- if shardingEnabled
+                          then putTemplate tpl tplName
+                          else putMapping ix mapping (baseMapping mapping)
+                  unless (statusIsSuccessful (responseStatus r2)) $
+                    liftIO $ throwIO (CouldNotCreateMapping r2)
+              else liftIO $ throwIO IndexDoesNotExist
 
   workers <- replicateM (unEsPoolSize essPoolSize) $ async $
     case essQueueSendThreshold of
