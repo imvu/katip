@@ -121,6 +121,8 @@ data EsScribeCfg = EsScribeCfg {
     -- ^ What kind of guarantee is made that a log message will be queued
     , essShouldAdminES :: ShouldAdminES
     -- ^ Whether or not the application should manage es (createIndex / update index) or if this is managed by another team
+    , essCallback :: ReportFn
+    -- ^ Since logging relies on this being configured, give an escape hatch for debugging why logging fails
     } deriving (Typeable)
 
 
@@ -143,6 +145,8 @@ data EsScribeCfg = EsScribeCfg {
 --     * NoGuarantee on writing log messages
 --
 --     * This application can administer elasticsearch
+--
+--     * No callback
 defaultEsScribeCfg :: EsScribeCfg
 defaultEsScribeCfg = EsScribeCfg {
       essRetryPolicy          = exponentialBackoff 25 <> limitRetries 5
@@ -154,33 +158,8 @@ defaultEsScribeCfg = EsScribeCfg {
     , essQueueSendThreshold   = SendEach
     , essLoggingGuarantees    = NoGuarantee
     , essShouldAdminES        = AdminES
+    , essCallback             = Nothing
     }
-
-data QueueSendThreshold = SendEach
-                        -- ^ Log each elemnt using indexDocument
-                        | BulkSend !BulkSendType
-                        -- ^ Use a bulk strategy when logging the document
-                        deriving (Typeable)
-
-data BulkSendType = SendThresholdCount !Int
-                  -- ^ Simple count threshold for bulk sending. Try to get up to the number of log elements to send
-                  | SendThresholdPredicate (Maybe ((Maybe (IndexName, Value))) -> [(IndexName,Value)] -> (Bool, [(IndexName, Value)]))
-                  -- ^ User provided predicate for how to determine when to stop accumulating log elements for bulk sending
-                  deriving (Typeable)
-
-data LoggingGuarantees = NoGuarantee
-                       -- ^ Try to write the message to the queue once, if it fails, it fails
-                       | Try !Int
-                       -- ^ Try up to N times to send the message to the queue (with a small delay between messages)
-                       | TryWithPolicy !RetryPolicy
-                       -- ^ Try using a retry policy
-                       | TryAll
-                       -- ^ Keep trying every millisecond to queue the message.
-
-data ShouldAdminES = NoAdminES
-                   | CheckExistsNoAdminES
-                   | AdminES
-                   deriving (Typeable)
 
 
 -------------------------------------------------------------------------------
@@ -297,6 +276,40 @@ splitTime t = asMins `divMod` 60
     asMins = floor t `div` 60
 
 
+
+-------------------------------------------------------------------------------
+data QueueSendThreshold = SendEach
+                        -- ^ Log each elemnt using indexDocument
+                        | BulkSend !BulkSendType
+                        -- ^ Use a bulk strategy when logging the document
+                        deriving (Typeable)
+
+-------------------------------------------------------------------------------
+data BulkSendType = SendThresholdCount !Int
+                  -- ^ Simple count threshold for bulk sending. Try to get up to the number of log elements to send
+                  | SendThresholdPredicate (Maybe ((Maybe (IndexName, Value))) -> [(IndexName,Value)] -> (Bool, [(IndexName, Value)]))
+                  -- ^ User provided predicate for how to determine when to stop accumulating log elements for bulk sending
+                  deriving (Typeable)
+
+-------------------------------------------------------------------------------
+data LoggingGuarantees = NoGuarantee
+                       -- ^ Try to write the message to the queue once, if it fails, it fails
+                       | Try !Int
+                       -- ^ Try up to N times to send the message to the queue (with a small delay between messages)
+                       | TryWithPolicy !RetryPolicy
+                       -- ^ Try using a retry policy
+                       | TryAll
+                       -- ^ Keep trying every millisecond to queue the message.
+
+-------------------------------------------------------------------------------
+data ShouldAdminES = NoAdminES
+                   | CheckExistsNoAdminES
+                   | AdminES
+                   deriving (Typeable)
+
+-------------------------------------------------------------------------------
+type ReportFn = Maybe (T.Text -> IO ())
+
 -------------------------------------------------------------------------------
 data EsScribeSetupError = CouldNotCreateIndex !Reply
                         | CouldNotCreateMapping !Reply
@@ -320,6 +333,13 @@ shouldAdminES AdminES = True
 shouldAdminES CheckExistsNoAdminES = False
 shouldAdminES NoAdminES = False
 
+report
+    :: ReportFn
+    -> T.Text
+    -> IO ()
+report (Just f) t = f t
+report Nothing _ = pure ()
+
 -------------------------------------------------------------------------------
 mkEsScribe
     :: EsScribeCfg
@@ -336,28 +356,31 @@ mkEsScribe cfg@EsScribeCfg {..} env ix mapping sev verb = do
   endSig <- newEmptyMVar
 
   when (checkIndexExists essShouldAdminES) $
-      runBH env $ do
-        chk <- indexExists ix
-        -- note that this doesn't update settings. That's not available
-        -- through the Bloodhound API yet
-        if chk
-          then return ()
-          else if shouldAdminES essShouldAdminES
-              then void $ do
-                  r1 <- createIndex essIndexSettings ix
-                  unless (statusIsSuccessful (responseStatus r1)) $
-                    liftIO $ throwIO (CouldNotCreateIndex r1)
-                  r2 <- if shardingEnabled
-                          then putTemplate tpl tplName
-                          else putMapping ix mapping (baseMapping mapping)
-                  unless (statusIsSuccessful (responseStatus r2)) $
-                    liftIO $ throwIO (CouldNotCreateMapping r2)
-              else liftIO $ throwIO IndexDoesNotExist
+    runBH env $ do
+      report' $ "Checking if index " <> (T.pack $ show ix) <> " exists"
+      chk <- indexExists ix
+      -- note that this doesn't update settings. That's not available
+      -- through the Bloodhound API yet
+      if chk
+        then pure ()
+        else if shouldAdminES essShouldAdminES
+          then void $ do
+            report' $ "Creating the index " <> (T.pack $ show ix)
+            r1 <- createIndex essIndexSettings ix
+            unless (statusIsSuccessful (responseStatus r1)) $
+              liftIO $ throwIO (CouldNotCreateIndex r1)
+            r2 <- if shardingEnabled
+              then putTemplate tpl tplName
+              else putMapping ix mapping (baseMapping mapping)
+            unless (statusIsSuccessful (responseStatus r2)) $
+              liftIO $ throwIO (CouldNotCreateMapping r2)
+          else liftIO $ throwIO IndexDoesNotExist
 
+  report' $ "Making workers: count(" <> (T.pack $ show essPoolSize) <> ")"
   workers <- replicateM (unEsPoolSize essPoolSize) $ async $
     case essQueueSendThreshold of
-      SendEach -> startWorker cfg env mapping q
-      BulkSend t -> startBulkWorker cfg env t mapping q
+      SendEach -> report' "Starting a single log worker" >> startWorker cfg env mapping q
+      BulkSend t -> report' "Starting a bulk log worker" >> startBulkWorker cfg env t mapping q
 
   _ <- async $ do
     takeMVar endSig
@@ -371,6 +394,7 @@ mkEsScribe cfg@EsScribeCfg {..} env ix mapping sev verb = do
   let finalizer = putMVar endSig () >> takeMVar endSig
   return (scribe, finalizer)
   where
+    report' text = liftIO $ report essCallback text
     tplName = TemplateName ixn
     shardingEnabled = case essIndexSharding of
       NoIndexSharding -> False
@@ -392,7 +416,7 @@ mkEsScribe cfg@EsScribeCfg {..} env ix mapping sev verb = do
         Just False -> True
         _ -> False
 
-    retryWrite retryPolicy q i = retrying retryPolicy (const $ return . checkFailedWrite) $ \_ -> writeToQueue q i
+    retryWrite retryPolicy q i = retrying retryPolicy (const $ pure . checkFailedWrite) $ \_ -> writeToQueue q i
 
 
 
@@ -488,7 +512,9 @@ startWorker EsScribeCfg {..} env mapping q = go
         Just (ixn, v) -> do
           sendLog ixn v `catchAny` eat
           go
-        Nothing -> return ()
+        Nothing -> do
+          report' "Single Logger closing"
+          return ()
     sendLog :: IndexName -> Value -> IO ()
     sendLog ixn v = void $ recovering essRetryPolicy [handler] $ const $ do
       did <- mkDocId
@@ -499,6 +525,7 @@ startWorker EsScribeCfg {..} env mapping q = go
       case fromException e of
         Just (_ :: AsyncException) -> return False
         _ -> return True
+    report' text = liftIO $ report essCallback text
 
 startBulkWorker
     :: EsScribeCfg
@@ -516,20 +543,23 @@ startBulkWorker EsScribeCfg {..} env bulkType mapping q = go
       case blockingElement of
         Just be -> do
           popped <- unfoldWhileM popPred popAction [be]
-          let bulkOp ixn v = mkDocId >>= \did -> return $ BulkIndex ixn mapping did v
+          let bulkOp ixn v = mkDocId >>= \did -> pure $ BulkIndex ixn mapping did v
           bulkOps <- V.fromList <$> mapM (\(ixn, v) -> bulkOp ixn v) popped
           sendLog bulkOps `catchAny` eat
           go
-        Nothing -> return ()
+        Nothing -> do
+          report' "Bulk Logger closing"
+          pure ()
     sendLog :: V.Vector BulkOperation -> IO ()
     sendLog ops = void $ recovering essRetryPolicy [handler] $ const $ do
       res <- runBH env $ bulk ops
-      return res
-    eat _ = return ()
+      pure res
+    eat _ = pure ()
     handler _ = Handler $ \e ->
       case fromException e of
         Just (_ :: AsyncException) -> return False
         _ -> return True
+    report' text = liftIO $ report essCallback text
 
 
 mkSendPredicate
@@ -561,4 +591,4 @@ unfoldWhileM p m a = loop a
             let (cont, res) = p x ac
             if cont
                 then loop res
-                else return res
+                else pure res
