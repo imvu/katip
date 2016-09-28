@@ -24,7 +24,7 @@ import           Data.Scientific
 import           Data.Time
 import           Data.Time.Calendar.WeekDate
 import qualified Data.Vector                 as V
-import           Database.Bloodhound         hiding (key)
+import           Database.Bloodhound         hiding (key, Status)
 import           Network.HTTP.Client
 import           Network.HTTP.Types.Status
 import           Test.QuickCheck.Instances   ()
@@ -126,6 +126,35 @@ esTests = testGroup "elasticsearch scribe"
           let logTomorrow = head tomorrowLogs
           logToday ^? key "_source" . key "msg" . _String @?= Just "today"
           logTomorrow ^? key "_source" . key "msg" . _String @?= Just "tomorrow"
+  , withSearch' (\c -> c { essQueueSendThreshold = BulkSend $ SendThresholdCount 3, essLoggingGuarantees = Try 5}) $ \setup -> testCase "test bulk sending" $ do
+      let t1 = mkTime 2016 1 2 3 4 5
+      fakeClock <- newTVarIO t1
+      withTestLogging' (set logEnvTimer (readTVarIO fakeClock)) setup $ \done -> do
+        $(logT) (ExampleCtx True) mempty InfoS "today"
+        let t2 = mkTime 2016 1 3 3 4 5
+        liftIO (atomically (writeTVar fakeClock t2))
+        $(logT) (ExampleCtx True) mempty InfoS "tomorrow"
+        liftIO $ do
+          void $ bh (refreshIndex ixn)
+          getLogsByIndexWithStatus_ (IndexName "katip-elasticsearch-tests-2016-01-02") status404
+          getLogsByIndexWithStatus_ (IndexName "katip-elasticsearch-tests-2016-01-03") status404
+        let t3 = mkTime 2016 1 4 3 4 5
+        liftIO (atomically (writeTVar fakeClock t3))
+        $(logT) (ExampleCtx True) mempty InfoS "nextTomorrow"
+        liftIO $ do
+          void $ done
+          todayLogs <- getLogsByIndex (IndexName "katip-elasticsearch-tests-2016-01-02")
+          tomorrowLogs <- getLogsByIndex (IndexName "katip-elasticsearch-tests-2016-01-03")
+          nextTomorrowLogs <- getLogsByIndex (IndexName "katip-elasticsearch-tests-2016-01-04")
+          assertBool ("todayLogs has " <> show (length todayLogs) <> " items") (length todayLogs == 1)
+          assertBool ("tomorrowLogs has " <> show (length tomorrowLogs) <> " items") (length tomorrowLogs == 1)
+          assertBool ("nextTomorrowLogs has " <> show (length nextTomorrowLogs) <> " items") (length nextTomorrowLogs == 1)
+          let logToday = head todayLogs
+          let logTomorrow = head tomorrowLogs
+          let logNextTomorrow = head nextTomorrowLogs
+          logToday ^? key "_source" . key "msg" . _String @?= Just "today"
+          logTomorrow ^? key "_source" . key "msg" . _String @?= Just "tomorrow"
+          logNextTomorrow ^? key "_source" . key "msg" . _String @?= Just "nextTomorrow"
   ]
 
 
@@ -246,6 +275,14 @@ getLogsByIndex i = do
   assertBool ("search by " <> show i <> " " <> show actualCode <> " /= 200") (actualCode == 200)
   return $ responseBody r ^.. key "hits" . key "hits" . values
 
+getLogsByIndexWithStatus_ :: IndexName -> Status -> IO ()
+getLogsByIndexWithStatus_ i s = do
+  r <- bh $ do
+    void (refreshIndex i)
+    searchByIndex i (mkSearch Nothing Nothing)
+  let actualCode = statusCode (responseStatus r)
+  assertBool ("search by " <> show i <> " " <> show actualCode <> " /= " <> show (statusCode s)) (actualCode == (statusCode s))
+  return ()
 
 -------------------------------------------------------------------------------
 bh :: BH IO a -> IO a

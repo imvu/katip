@@ -512,14 +512,15 @@ startBulkWorker EsScribeCfg {..} env bulkType mapping q = go
     go = do
       let popAction = atomically $ tryReadTBMQueue q
           popPred = mkSendPredicate bulkType
-      popped <- unfoldWhileM popPred popAction []
-      case popped of
-        [] -> return ()
-        _ -> do
+      blockingElement <- atomically $ readTBMQueue q
+      case blockingElement of
+        Just be -> do
+          popped <- unfoldWhileM popPred popAction [be]
           let bulkOp ixn v = mkDocId >>= \did -> return $ BulkIndex ixn mapping did v
           bulkOps <- V.fromList <$> mapM (\(ixn, v) -> bulkOp ixn v) popped
           sendLog bulkOps `catchAny` eat
           go
+        Nothing -> return ()
     sendLog :: V.Vector BulkOperation -> IO ()
     sendLog ops = void $ recovering essRetryPolicy [handler] $ const $ do
       res <- runBH env $ bulk ops
