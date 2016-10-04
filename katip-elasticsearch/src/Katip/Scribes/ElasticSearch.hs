@@ -43,11 +43,18 @@ module Katip.Scribes.ElasticSearch
     , essQueueSendThreshold
     , QueueSendThreshold(..)
     , BulkSendType(..)
+    , Timeout(..)
+    , Seconds(..)
+    , MicroSeconds(..)
     , essLoggingGuarantees
     , LoggingGuarantees(..)
     , essShouldAdminES
     , ShouldAdminES(..)
-    , essCallback
+    , essDebugCallback
+    , DebugCallback(..)
+    , DebugStatus(..)
+    , ReportFn
+    , ReportSignal
     , defaultEsScribeCfg
     -- * Utilities
     , mkDocId
@@ -55,12 +62,13 @@ module Katip.Scribes.ElasticSearch
     , roundToSunday
     ) where
 
-
 -------------------------------------------------------------------------------
 import           Control.Applicative                     as A
 import           Control.Concurrent
 import           Control.Concurrent.Async
 import           Control.Concurrent.STM.TBMQueue
+import           Control.Concurrent.STM.TVar
+import           Control.Concurrent.STM.TBChan
 import           Control.Exception.Base
 import           Control.Exception.Enclosed
 import           Control.Monad
@@ -84,7 +92,7 @@ import           Data.Typeable
 import           Data.UUID
 import qualified Data.UUID.V4                            as UUID4
 import qualified Data.Vector                             as V
-import           Database.Bloodhound
+import           Database.Bloodhound                     hiding (Seconds)
 import           Network.HTTP.Client
 import           Network.HTTP.Types.Status
 import           Text.Printf                             (printf)
@@ -93,15 +101,14 @@ import           Katip.Core
 import           Katip.Scribes.ElasticSearch.Annotations
 -------------------------------------------------------------------------------
 
-
 data EsScribeCfg = EsScribeCfg {
-      essRetryPolicy   :: RetryPolicy
+      essRetryPolicy          :: !RetryPolicy
     -- ^ Retry policy when there are errors sending logs to the server
-    , essQueueSize     :: EsQueueSize
+    , essQueueSize            :: !EsQueueSize
     -- ^ Maximum size of the bounded log queue
-    , essPoolSize      :: EsPoolSize
+    , essPoolSize             :: !EsPoolSize
     -- ^ Worker pool size limit for sending data to the
-    , essAnnotateTypes :: Bool
+    , essAnnotateTypes        :: !Bool
     -- ^ Different payload items coexist in the "data" attribute in
     -- ES. It is possible for different payloads to have different
     -- types for the same key, e.g. an "id" key that is sometimes a
@@ -114,18 +121,17 @@ data EsScribeCfg = EsScribeCfg {
     -- exposes a querying API, we will try to make deserialization and
     -- querying transparently remove the type annotations if this is
     -- enabled.
-    , essIndexSettings :: IndexSettings
-    , essIndexSharding :: IndexShardingPolicy
-    , essQueueSendThreshold :: QueueSendThreshold
+    , essIndexSettings        :: !IndexSettings
+    , essIndexSharding        :: !IndexShardingPolicy
+    , essQueueSendThreshold   :: !QueueSendThreshold
     -- ^ Configures how logs should be batched
-    , essLoggingGuarantees :: LoggingGuarantees
+    , essLoggingGuarantees    :: !LoggingGuarantees
     -- ^ What kind of guarantee is made that a log message will be queued
-    , essShouldAdminES :: ShouldAdminES
+    , essShouldAdminES        :: !ShouldAdminES
     -- ^ Whether or not the application should manage es (createIndex / update index) or if this is managed by another team
-    , essCallback :: ReportFn
+    , essDebugCallback        :: !DebugCallback
     -- ^ Since logging relies on this being configured, give an escape hatch for debugging why logging fails
     } deriving (Typeable)
-
 
 -- | Reasonable defaults for a config:
 --
@@ -159,9 +165,8 @@ defaultEsScribeCfg = EsScribeCfg {
     , essQueueSendThreshold   = SendEach
     , essLoggingGuarantees    = NoGuarantee
     , essShouldAdminES        = AdminES
-    , essCallback             = Nothing
+    , essDebugCallback        = NoCallback
     }
-
 
 -------------------------------------------------------------------------------
 -- | How should katip store your log data?
@@ -203,22 +208,19 @@ data IndexShardingPolicy = NoIndexSharding
                          | EveryMinuteIndexSharding
                          | CustomIndexSharding (forall a. Item a -> [IndexNameSegment])
 
-
 instance Show IndexShardingPolicy where
- show NoIndexSharding          = "NoIndexSharding"
- show MonthlyIndexSharding     = "MonthlyIndexSharding"
- show WeeklyIndexSharding      = "WeeklyIndexSharding"
- show DailyIndexSharding       = "DailyIndexSharding"
- show HourlyIndexSharding      = "HourlyIndexSharding"
- show EveryMinuteIndexSharding = "EveryMinuteIndexSharding"
- show (CustomIndexSharding _)  = "CustomIndexSharding λ"
-
+  show NoIndexSharding          = "NoIndexSharding"
+  show MonthlyIndexSharding     = "MonthlyIndexSharding"
+  show WeeklyIndexSharding      = "WeeklyIndexSharding"
+  show DailyIndexSharding       = "DailyIndexSharding"
+  show HourlyIndexSharding      = "HourlyIndexSharding"
+  show EveryMinuteIndexSharding = "EveryMinuteIndexSharding"
+  show (CustomIndexSharding _)  = "CustomIndexSharding λ"
 
 -------------------------------------------------------------------------------
 newtype IndexNameSegment = IndexNameSegment {
       indexNameSegment :: Text
     } deriving (Show, Eq, Ord)
-
 
 -------------------------------------------------------------------------------
 shardPolicySegs :: IndexShardingPolicy -> Item a -> [IndexNameSegment]
@@ -242,7 +244,6 @@ shardPolicySegs EveryMinuteIndexSharding Item {..} = [sis y, sis m, sis d, sis h
     (h, mn) = splitTime (utctDayTime _itemTime)
 shardPolicySegs (CustomIndexSharding f) i  = f i
 
-
 -------------------------------------------------------------------------------
 -- | If the given day is sunday, returns the input, otherwise returns
 -- the previous sunday
@@ -254,7 +255,6 @@ roundToSunday d
   where
     (y, w, dow) = toWeekDate d
 
-
 -------------------------------------------------------------------------------
 chooseIxn :: IndexName -> IndexShardingPolicy -> Item a -> IndexName
 chooseIxn (IndexName ixn) p i =
@@ -262,13 +262,11 @@ chooseIxn (IndexName ixn) p i =
   where
     segs = indexNameSegment A.<$> shardPolicySegs p i
 
-
 -------------------------------------------------------------------------------
 sis :: Integral a => a -> IndexNameSegment
 sis = IndexNameSegment . T.pack . fmt
   where
     fmt = printf "%02d" . toInteger
-
 
 -------------------------------------------------------------------------------
 splitTime :: DiffTime -> (Int, Int)
@@ -276,19 +274,33 @@ splitTime t = asMins `divMod` 60
   where
     asMins = floor t `div` 60
 
+-------------------------------------------------------------------------------
+newtype Seconds = Seconds Int
+                deriving (Typeable)
 
+-------------------------------------------------------------------------------
+newtype MicroSeconds = MicroSeconds Int
+                     deriving (Typeable)
+
+-------------------------------------------------------------------------------
+-- | Configurable timeout for bulk sending
+data Timeout = Timeout Seconds MicroSeconds
+             -- ^ Configure to timeout using a set time
+             | TimeoutExt (TVar Bool)
+             -- ^ Configure to timeout using a synchronized variable
+             deriving (Typeable)
 
 -------------------------------------------------------------------------------
 data QueueSendThreshold = SendEach
-                        -- ^ Log each elemnt using indexDocument
-                        | BulkSend !BulkSendType
+                        -- ^ Log each element using indexDocument
+                        | BulkSend !Timeout !BulkSendType
                         -- ^ Use a bulk strategy when logging the document
                         deriving (Typeable)
 
 -------------------------------------------------------------------------------
 data BulkSendType = SendThresholdCount !Int
                   -- ^ Simple count threshold for bulk sending. Try to get up to the number of log elements to send
-                  | SendThresholdPredicate (Maybe ((Maybe (IndexName, Value))) -> [(IndexName,Value)] -> (Bool, [(IndexName, Value)]))
+                  | SendThresholdPredicate ([(IndexName,Value)] -> Bool)
                   -- ^ User provided predicate for how to determine when to stop accumulating log elements for bulk sending
                   deriving (Typeable)
 
@@ -303,23 +315,54 @@ data LoggingGuarantees = NoGuarantee
                        -- ^ Keep trying every millisecond to queue the message.
 
 -------------------------------------------------------------------------------
+-- | Configures the scribe with some level of elastic search index configuration
+--
+-- In certain environments the software should not be allowed to administer ES at all
 data ShouldAdminES = NoAdminES
+                   -- ^ Do no ES administartion. Its up to someone else
                    | CheckExistsNoAdminES
+                   -- ^ Check that the index exists
                    | AdminES
+                   -- ^ Fully administer the index (create and check)
                    deriving (Typeable)
 
 -------------------------------------------------------------------------------
+-- | Debug callback to report / signal information about the scribes state
+--
+-- Useful for testing and reporting why something may not be working / started in production
+data DebugCallback = DebugCallback { unReportFn :: ReportFn
+                                   -- ^ Logging for the scribes setup
+                                   , unReportSignal :: ReportSignal
+                                   -- ^ Signal that can be used to get reports about the scribe
+                                   }
+                   -- ^ Configure a callback
+                   | NoCallback
+                   -- ^ Configure no callback
+                   deriving (Typeable)
+
+-- | Alias for a reporting function
 type ReportFn = Maybe (T.Text -> IO ())
+
+-- | Alias for a reporting signal
+type ReportSignal = Maybe (TBChan DebugStatus)
+
+-- | Reporting signal messages
+data DebugStatus = DSSent !Int
+                 -- ^ How many messages were sent
+                 | DSStartWait
+                 -- ^ Waiting on timeout signal
+                 deriving (Eq, Typeable)
+
 
 -------------------------------------------------------------------------------
 data EsScribeSetupError = CouldNotCreateIndex !Reply
                         | CouldNotCreateMapping !Reply
                         | IndexDoesNotExist deriving (Typeable, Show)
 
-
 instance Exception EsScribeSetupError
 
 
+-------------------------------------------------------------------------------
 checkIndexExists
     :: ShouldAdminES
     -> Bool
@@ -327,6 +370,7 @@ checkIndexExists AdminES = True
 checkIndexExists CheckExistsNoAdminES = True
 checkIndexExists NoAdminES = False
 
+-------------------------------------------------------------------------------
 shouldAdminES
     :: ShouldAdminES
     -> Bool
@@ -334,12 +378,21 @@ shouldAdminES AdminES = True
 shouldAdminES CheckExistsNoAdminES = False
 shouldAdminES NoAdminES = False
 
+-------------------------------------------------------------------------------
 report
-    :: ReportFn
+    :: DebugCallback
     -> T.Text
     -> IO ()
-report (Just f) t = f t
-report Nothing _ = pure ()
+report (DebugCallback (Just f) _) t = f t
+report _ _ = pure ()
+
+-------------------------------------------------------------------------------
+signal
+    :: DebugCallback
+    -> DebugStatus
+    -> IO ()
+signal (DebugCallback _ (Just s)) i = atomically $ writeTBChan s i
+signal _ _ = pure ()
 
 -------------------------------------------------------------------------------
 mkEsScribe
@@ -381,7 +434,7 @@ mkEsScribe cfg@EsScribeCfg {..} env ix mapping sev verb = do
   workers <- replicateM (unEsPoolSize essPoolSize) $ async $
     case essQueueSendThreshold of
       SendEach -> report' "Starting a single log worker" >> startWorker cfg env mapping q
-      BulkSend t -> report' "Starting a bulk log worker" >> startBulkWorker cfg env t mapping q
+      BulkSend timeout t -> report' "Starting a bulk log worker" >> startBulkWorker cfg env timeout t mapping q
 
   _ <- async $ do
     takeMVar endSig
@@ -395,7 +448,7 @@ mkEsScribe cfg@EsScribeCfg {..} env ix mapping sev verb = do
   let finalizer = putMVar endSig () >> takeMVar endSig
   return (scribe, finalizer)
   where
-    report' text = liftIO $ report essCallback text
+    report' text = liftIO $ report essDebugCallback text
     tplName = TemplateName ixn
     shardingEnabled = case essIndexSharding of
       NoIndexSharding -> False
@@ -418,9 +471,6 @@ mkEsScribe cfg@EsScribeCfg {..} env ix mapping sev verb = do
         _ -> False
 
     retryWrite retryPolicy q i = retrying retryPolicy (const $ pure . checkFailedWrite) $ \_ -> writeToQueue q i
-
-
-
 
 -------------------------------------------------------------------------------
 baseMapping :: MappingName -> Value
@@ -449,47 +499,38 @@ baseMapping (MappingName mn) =
                           , "type" .= String "date"
                           ]
 
-
 -------------------------------------------------------------------------------
 -- | Handle both old-style aeson and picosecond-level precision
 esDateFormat :: Text
 esDateFormat = "yyyy-MM-dd'T'HH:mm:ssZ||yyyy-MM-dd'T'HH:mm:ss.SSSZ||yyyy-MM-dd'T'HH:mm:ss.SSSSSSSSSSSSZ"
 
-
 -------------------------------------------------------------------------------
 mkDocId :: IO DocId
 mkDocId = (DocId . T.decodeUtf8 . toASCIIBytes) `fmap` UUID4.nextRandom
-
 
 -------------------------------------------------------------------------------
 newtype EsQueueSize = EsQueueSize {
        unEsQueueSize :: Int
      } deriving (Show, Eq, Ord)
 
-
 instance Bounded EsQueueSize where
   minBound = EsQueueSize 1
   maxBound = EsQueueSize maxBound
 
-
 mkEsQueueSize :: Int -> Maybe EsQueueSize
 mkEsQueueSize = mkNonZero EsQueueSize
-
 
 -------------------------------------------------------------------------------
 newtype EsPoolSize = EsPoolSize {
       unEsPoolSize :: Int
     } deriving (Show, Eq, Ord)
 
-
 instance Bounded EsPoolSize where
   minBound = EsPoolSize 1
   maxBound = EsPoolSize maxBound
 
-
 mkEsPoolSize :: Int -> Maybe EsPoolSize
 mkEsPoolSize = mkNonZero EsPoolSize
-
 
 -------------------------------------------------------------------------------
 mkNonZero :: (Int -> a) -> Int -> Maybe a
@@ -497,6 +538,26 @@ mkNonZero ctor n
   | n > 0     = Just $ ctor n
   | otherwise = Nothing
 
+-------------------------------------------------------------------------------
+timeoutInMicroSeconds
+  :: Seconds
+  -> MicroSeconds
+  -> Int
+timeoutInMicroSeconds (Seconds s) (MicroSeconds ms) = (s * 1000000) + ms
+
+-------------------------------------------------------------------------------
+mkTimeout
+  :: Timeout
+  -> IO (TVar Bool)
+mkTimeout (Timeout s ms) = registerDelay $ timeoutInMicroSeconds s ms
+mkTimeout (TimeoutExt t) = return t
+
+-------------------------------------------------------------------------------
+cancelTimeout
+  :: Timeout
+  -> IO ()
+cancelTimeout (Timeout _ _) = return ()
+cancelTimeout (TimeoutExt t) = atomically $ writeTVar t False
 
 -------------------------------------------------------------------------------
 startWorker
@@ -526,31 +587,94 @@ startWorker EsScribeCfg {..} env mapping q = go
       case fromException e of
         Just (_ :: AsyncException) -> return False
         _ -> return True
-    report' text = liftIO $ report essCallback text
+    report' text = liftIO $ report essDebugCallback text
 
 startBulkWorker
     :: EsScribeCfg
     -> BHEnv
+    -> Timeout
+    -- ^ Timeout strategy for waiting alternative to predicate
     -> BulkSendType
+    -- ^ What is the bulking strategy
     -> MappingName
     -> TBMQueue (IndexName, Value)
     -> IO ()
-startBulkWorker EsScribeCfg {..} env bulkType mapping q = go
+startBulkWorker EsScribeCfg {..} env timeout bulkType mapping q = do
+  stopSignal <- newTVarIO False
+  acc <- newTVarIO []
+
+  let popAction = tryReadTBMQueue q
+  -- Start an action that will read from our queue into an accumulation
+  -- variable to bulk up values
+  _ <- async $ do
+    let act = do
+          v <- atomically $ popAction
+          case v of
+            -- If the queue has been closed and is empty we want to signal that its all over
+            Nothing -> do
+              atomically $ writeTVar stopSignal True
+              return False
+            -- Reading an empty queue should continue to try reading
+            Just Nothing -> return True
+            -- Accumulate the value and continue
+            Just (Just v') -> do
+              atomically $ do
+                !es <- readTVar acc
+                writeTVar acc (v':es)
+              return True
+    -- If we have been told not to continue stop recursing
+    let act' = act >>= \x -> if x
+          then yield >> act'
+          else return ()
+    act'
+
+  -- Start the recursive worker
+  go stopSignal acc
   where
-    go = do
-      let popAction = atomically $ tryReadTBMQueue q
-          popPred = mkSendPredicate bulkType
-      blockingElement <- atomically $ readTBMQueue q
-      case blockingElement of
-        Just be -> do
-          popped <- unfoldWhileM popPred popAction [be]
-          let bulkOp ixn v = mkDocId >>= \did -> pure $ BulkIndex ixn mapping did v
-          bulkOps <- V.fromList <$> mapM (\(ixn, v) -> bulkOp ixn v) popped
-          sendLog bulkOps `catchAny` eat
-          go
-        Nothing -> do
+    go stopSignal acc = do
+      let popPred = mkSendPredicate bulkType
+
+      timedOut <- mkTimeout timeout
+
+
+      -- Wait until the timeout is true
+      let waitTimeout = do
+            x <- readTVar timedOut
+            when (not x) retry
+
+      -- Wait until the predicate is false
+      let waitEls = do
+            es <- readTVar acc
+            let cont = popPred es
+            when cont $ retry
+
+      -- If we are set to debug, send a signal to the configured signal var that we are starting a wait
+      signal' $ DSStartWait
+      -- Wait on timeout or predicate to stop retrying, return all the accumulated values
+      popped <- atomically $ do
+        waitTimeout <|> waitEls
+        swapTVar acc []
+      -- Cleanup the timeout
+      cancelTimeout timeout
+
+
+      -- If we have values to send, bulk them up and send them
+      when (length popped > 0) $ do
+        let bulkOp ixn v = mkDocId >>= \did -> pure $ BulkIndex ixn mapping did v
+        bulkOps <- V.fromList <$> mapM (\(ixn, v) -> bulkOp ixn v) popped
+        sendLog bulkOps `catchAny` eat
+        -- If we are set to debug, send a signal for how many items were sent
+        signal' $ DSSent $ length popped
+
+      -- Is the queue closed?
+      stop <- atomically $ readTVar stopSignal
+
+      if stop
+        then do
           report' "Bulk Logger closing"
           pure ()
+        else go stopSignal acc
+
     sendLog :: V.Vector BulkOperation -> IO ()
     sendLog ops = void $ recovering essRetryPolicy [handler] $ const $ do
       res <- runBH env $ bulk ops
@@ -560,36 +684,17 @@ startBulkWorker EsScribeCfg {..} env bulkType mapping q = go
       case fromException e of
         Just (_ :: AsyncException) -> return False
         _ -> return True
-    report' text = liftIO $ report essCallback text
 
+    report' text = liftIO $ report essDebugCallback text
+    signal' i = liftIO $ signal essDebugCallback i
 
 mkSendPredicate
     :: BulkSendType
-    -> Maybe (Maybe (IndexName, Value))
     -> [(IndexName, Value)]
-    -> (Bool, [(IndexName, Value)])
+    -> Bool
 mkSendPredicate (SendThresholdCount i) = go
-    where
-        go !el !ac = case el of
-            Just Nothing -> (False, ac)
-            Just (Just v) -> if (length ac + 1) >= i
-                then (False, v:ac)
-                else (True, v:ac)
-            Nothing -> (False, ac)
+  where
+    go !ac = if (length ac) >= i
+      then False
+      else True
 mkSendPredicate (SendThresholdPredicate p) = p
-
-
-unfoldWhileM
-    :: Monad m
-    => (a -> b -> (Bool, b))
-    -> m a
-    -> b
-    -> m b
-unfoldWhileM p m a = loop a
-    where
-        loop ac = do
-            x <- m
-            let (cont, res) = p x ac
-            if cont
-                then loop res
-                else pure res
