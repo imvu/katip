@@ -96,7 +96,9 @@ test-suite test
     , unordered-containers
     , scientific
     , time
+    , async
     , stm
+    , stm-chans
 
   if flag(lib-Werror)
     ghc-options: -Wall -Werror

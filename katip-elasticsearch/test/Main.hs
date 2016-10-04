@@ -10,7 +10,10 @@ module Main
 
 -------------------------------------------------------------------------------
 import           Control.Applicative         as A
+import           Control.Concurrent
+import           Control.Concurrent.Async
 import           Control.Concurrent.STM
+import           Control.Concurrent.STM.TBChan
 import           Control.Lens                hiding (mapping, (.=))
 import           Control.Monad
 import           Control.Monad.IO.Class
@@ -21,6 +24,7 @@ import qualified Data.HashMap.Strict         as HM
 import qualified Data.Map                    as M
 import           Data.Monoid
 import           Data.Scientific
+import qualified Data.Text.IO                as TIO
 import           Data.Time
 import           Data.Time.Calendar.WeekDate
 import qualified Data.Vector                 as V
@@ -57,6 +61,16 @@ setupSearch modScribeCfg = do
                                            , essIndexSettings = ixs
                                            })
 
+-------------------------------------------------------------------------------
+setupSearchIO :: (EsScribeCfg -> IO EsScribeCfg) -> IO (Scribe, IO ())
+setupSearchIO modScribeCfg = do
+    bh dropESSchema
+    mgr <- newManager defaultManagerSettings
+    cfg <- modScribeCfg (defaultEsScribeCfg { essAnnotateTypes = True
+                                            , essIndexSettings = ixs
+                                            })
+    mkEsScribe cfg (mkBHEnv svr mgr) ixn mn DebugS V3
+
 
 -------------------------------------------------------------------------------
 teardownSearch :: (Scribe, IO ()) -> IO ()
@@ -75,6 +89,10 @@ withSearch = withSearch' id
 -------------------------------------------------------------------------------
 withSearch' :: (EsScribeCfg -> EsScribeCfg) -> (IO (Scribe, IO ()) -> TestTree) -> TestTree
 withSearch' modScribeCfg = withResource (setupSearch modScribeCfg) teardownSearch
+
+-------------------------------------------------------------------------------
+withSearchIO :: (EsScribeCfg -> IO EsScribeCfg) -> (IO (Scribe, IO ()) -> TestTree) -> TestTree
+withSearchIO modScribeCfg = withResource (setupSearchIO modScribeCfg) teardownSearch
 
 
 -------------------------------------------------------------------------------
@@ -126,35 +144,72 @@ esTests = testGroup "elasticsearch scribe"
           let logTomorrow = head tomorrowLogs
           logToday ^? key "_source" . key "msg" . _String @?= Just "today"
           logTomorrow ^? key "_source" . key "msg" . _String @?= Just "tomorrow"
-  , withSearch' (\c -> c { essQueueSendThreshold = BulkSend $ SendThresholdCount 3, essLoggingGuarantees = Try 5}) $ \setup -> testCase "test bulk sending" $ do
-      let t1 = mkTime 2016 1 2 3 4 5
-      fakeClock <- newTVarIO t1
-      withTestLogging' (set logEnvTimer (readTVarIO fakeClock)) setup $ \done -> do
-        $(logT) (ExampleCtx True) mempty InfoS "today"
-        let t2 = mkTime 2016 1 3 3 4 5
-        liftIO (atomically (writeTVar fakeClock t2))
-        $(logT) (ExampleCtx True) mempty InfoS "tomorrow"
-        liftIO $ do
-          void $ bh (refreshIndex ixn)
-          getLogsByIndexWithStatus_ (IndexName "katip-elasticsearch-tests-2016-01-02") status404
-          getLogsByIndexWithStatus_ (IndexName "katip-elasticsearch-tests-2016-01-03") status404
-        let t3 = mkTime 2016 1 4 3 4 5
-        liftIO (atomically (writeTVar fakeClock t3))
-        $(logT) (ExampleCtx True) mempty InfoS "nextTomorrow"
-        liftIO $ do
-          void $ done
-          todayLogs <- getLogsByIndex (IndexName "katip-elasticsearch-tests-2016-01-02")
-          tomorrowLogs <- getLogsByIndex (IndexName "katip-elasticsearch-tests-2016-01-03")
-          nextTomorrowLogs <- getLogsByIndex (IndexName "katip-elasticsearch-tests-2016-01-04")
-          assertBool ("todayLogs has " <> show (length todayLogs) <> " items") (length todayLogs == 1)
-          assertBool ("tomorrowLogs has " <> show (length tomorrowLogs) <> " items") (length tomorrowLogs == 1)
-          assertBool ("nextTomorrowLogs has " <> show (length nextTomorrowLogs) <> " items") (length nextTomorrowLogs == 1)
-          let logToday = head todayLogs
-          let logTomorrow = head tomorrowLogs
-          let logNextTomorrow = head nextTomorrowLogs
-          logToday ^? key "_source" . key "msg" . _String @?= Just "today"
-          logTomorrow ^? key "_source" . key "msg" . _String @?= Just "tomorrow"
-          logNextTomorrow ^? key "_source" . key "msg" . _String @?= Just "nextTomorrow"
+  , let Just ps = mkEsPoolSize 1
+    in
+      withResource (newTVarIO False) (const $ return ()) $ \timeoutVar' ->
+      withResource (newTBChanIO 1) (const $ return ()) $ \tSig' ->
+      withSearchIO (\c -> do timeoutVar <- timeoutVar'
+                             tSig <- tSig'
+                             return $ c { essQueueSendThreshold = BulkSend (TimeoutExt timeoutVar) $ SendThresholdCount 3
+                                        , essLoggingGuarantees = Try 5
+                                        , essDebugCallback = DebugCallback (Just $ TIO.putStrLn) (Just $ tSig)
+                                        , essPoolSize = ps
+                                        }
+                  ) $ \setup -> testCase "test bulk sending" $ do
+        let t1 = mkTime 2016 1 2 3 4 5
+        fakeClock <- newTVarIO t1
+        timeoutVar <- timeoutVar'
+        tSig <- tSig'
+
+        let waitForSignal sig =
+              atomically $ do
+                sent <- readTBChan tSig
+                unless (sent == sig) retry
+            forceTimeout =
+              threadDelay 10 >> (atomically $ writeTVar timeoutVar True)
+
+        withTestLogging' (set logEnvTimer (readTVarIO fakeClock)) setup $ \done -> do
+          $(logT) (ExampleCtx True) mempty InfoS "today"
+          let t2 = mkTime 2016 1 3 3 4 5
+          liftIO (atomically (writeTVar fakeClock t2))
+          $(logT) (ExampleCtx True) mempty InfoS "tomorrow"
+          -- Test that a timeout will let a smaller number than bulk configured get sent
+          liftIO $ do
+            waitForSignal DSStartWait
+            forceTimeout
+            waitForSignal $ DSSent 2
+            void $ bh (refreshIndex ixn)
+            todayLogs <- getLogsByIndex (IndexName "katip-elasticsearch-tests-2016-01-02")
+            assertBool ("todayLogs has " <> show (length todayLogs) <> " items") (length todayLogs == 1)
+            tomorrowLogs <- getLogsByIndex (IndexName "katip-elasticsearch-tests-2016-01-03")
+            assertBool ("tomorrowLogs has " <> show (length tomorrowLogs) <> " items") (length tomorrowLogs == 1)
+            getLogsByIndexWithStatus_ (IndexName "katip-elasticsearch-tests-2016-01-04") status404
+          let t3 = mkTime 2016 1 4 3 4 5
+          liftIO (atomically (writeTVar fakeClock t3))
+          $(logT) (ExampleCtx True) mempty InfoS "nextTomorrow"
+          $(logT) (ExampleCtx True) mempty InfoS "nextTomorrow"
+          $(logT) (ExampleCtx True) mempty InfoS "nextTomorrow"
+          -- Test that a bulk configured get sent
+          liftIO $ do
+            waitForSignal DSStartWait
+            waitForSignal $ DSSent 3
+            void $ bh (refreshIndex ixn)
+            todayLogs <- getLogsByIndex (IndexName "katip-elasticsearch-tests-2016-01-02")
+            tomorrowLogs <- getLogsByIndex (IndexName "katip-elasticsearch-tests-2016-01-03")
+            nextTomorrowLogs <- getLogsByIndex (IndexName "katip-elasticsearch-tests-2016-01-04")
+            assertBool ("todayLogs has " <> show (length todayLogs) <> " items") (length todayLogs == 1)
+            assertBool ("tomorrowLogs has " <> show (length tomorrowLogs) <> " items") (length tomorrowLogs == 1)
+            assertBool ("nextTomorrowLogs has " <> show (length nextTomorrowLogs) <> " items") (length nextTomorrowLogs == 3)
+            let logToday = head todayLogs
+            let logTomorrow = head tomorrowLogs
+            let logNextTomorrow = head nextTomorrowLogs
+            logToday ^? key "_source" . key "msg" . _String @?= Just "today"
+            logTomorrow ^? key "_source" . key "msg" . _String @?= Just "tomorrow"
+            logNextTomorrow ^? key "_source" . key "msg" . _String @?= Just "nextTomorrow"
+            _ <- async $ do
+              waitForSignal DSStartWait
+              forceTimeout
+            void $ done
   ]
 
 
