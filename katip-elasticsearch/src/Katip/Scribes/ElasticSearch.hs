@@ -56,6 +56,7 @@ module Katip.Scribes.ElasticSearch
     , DebugStatus(..)
     , ReportFn
     , ReportSignal
+    , ShouldSignalBlock(..)
     , defaultEsScribeCfg
     -- * Utilities
     , mkDocId
@@ -356,8 +357,13 @@ data DebugCallback = DebugCallback { unReportFn :: ReportFn
 -- | Alias for a reporting function
 type ReportFn = Maybe (T.Text -> IO ())
 
+-- | Should signals block
+data ShouldSignalBlock = SignalBlock
+                       | SignalNoBlock
+                       deriving (Eq, Typeable)
+
 -- | Alias for a reporting signal
-type ReportSignal = Maybe (TBChan DebugStatus)
+type ReportSignal = Maybe (ShouldSignalBlock, TBChan DebugStatus)
 
 -- | Reporting signal messages
 data DebugStatus = DSSent !Int
@@ -414,8 +420,16 @@ signal
     :: DebugCallback
     -> DebugStatus
     -> IO ()
-signal (DebugCallback _ (Just s) _) i = atomically $ writeTBChan s i
+signal (DebugCallback _ (Just s) _) i = atomically $ signalWrite s i
 signal _ _ = pure ()
+
+signalWrite
+    :: (ShouldSignalBlock, TBChan DebugStatus)
+    -> DebugStatus
+    -> STM ()
+signalWrite (sb, s) i = case sb of
+  SignalBlock -> writeTBChan s i
+  SignalNoBlock -> void $ tryWriteTBChan s i
 
 -------------------------------------------------------------------------------
 mkEsScribe
@@ -514,12 +528,12 @@ startQueueReporting (DebugCallback _ (Just t) delay) (EsQueueSize size) q =
               threadDelay delay
               atomically $ do
                 estimateLen <- estimateFreeSlotsTBMQueue q
-                writeTBChan t (DSEstimateLength $ size - estimateLen)
+                signalWrite t (DSEstimateLength $ size - estimateLen)
             true = do
               threadDelay delay
               atomically $ do
                 trueLen <- freeSlotsTBMQueue q
-                writeTBChan t (DSTrueLength $ size - trueLen)
+                signalWrite t (DSTrueLength $ size - trueLen)
         replicateM_ 4 estimate
         true
   in Right <$> act
