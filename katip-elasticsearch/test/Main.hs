@@ -152,7 +152,7 @@ esTests = testGroup "elasticsearch scribe"
                              tSig <- tSig'
                              return $ c { essQueueSendThreshold = BulkSend $ BulkSendCfg (TimeoutExt timeoutVar) (SendThresholdCount 3) (MicroSeconds 100)
                                         , essLoggingGuarantees = Try 5
-                                        , essDebugCallback = DebugCallback (Just $ TIO.putStrLn) (Just $ tSig) 100000000
+                                        , essDebugCallback = DebugCallback (Just $ TIO.putStrLn) (Just $ (SignalBlock, tSig)) 100000000
                                         , essPoolSize = ps
                                         }
                   ) $ \setup -> testCase "test bulk sending" $ do
