@@ -334,6 +334,8 @@ data DebugCallback = DebugCallback { unReportFn :: ReportFn
                                    -- ^ Logging for the scribes setup
                                    , unReportSignal :: ReportSignal
                                    -- ^ Signal that can be used to get reports about the scribe
+                                   , unReportSchedule :: !Int
+                                   -- ^ How often to report queue information
                                    }
                    -- ^ Configure a callback
                    | NoCallback
@@ -351,6 +353,10 @@ data DebugStatus = DSSent !Int
                  -- ^ How many messages were sent
                  | DSStartWait
                  -- ^ Waiting on timeout signal
+                 | DSEstimateLength !Int
+                 -- ^ Estimated length of this queue
+                 | DSTrueLength !Int
+                 -- ^ True length of this queue
                  deriving (Eq, Typeable)
 
 
@@ -383,7 +389,7 @@ report
     :: DebugCallback
     -> T.Text
     -> IO ()
-report (DebugCallback (Just f) _) t = f t
+report (DebugCallback (Just f) _ _) t = f t
 report _ _ = pure ()
 
 -------------------------------------------------------------------------------
@@ -391,7 +397,7 @@ signal
     :: DebugCallback
     -> DebugStatus
     -> IO ()
-signal (DebugCallback _ (Just s)) i = atomically $ writeTBChan s i
+signal (DebugCallback _ (Just s) _) i = atomically $ writeTBChan s i
 signal _ _ = pure ()
 
 -------------------------------------------------------------------------------
@@ -442,6 +448,15 @@ mkEsScribe cfg@EsScribeCfg {..} env ix mapping sev verb = do
     mapM_ waitCatch workers
     putMVar endSig ()
 
+
+  startQueueReporting essDebugCallback q
+
+  _ <- async $ do
+    takeMVar endSig
+    atomically $ closeTBMQueue q
+    mapM_ waitCatch workers
+    putMVar endSig ()
+
   let scribe = Scribe $ \ i ->
         when (_itemSeverity i >= sev) $
           void $ writeAction q essLoggingGuarantees i
@@ -471,6 +486,26 @@ mkEsScribe cfg@EsScribeCfg {..} env ix mapping sev verb = do
         _ -> False
 
     retryWrite retryPolicy q i = retrying retryPolicy (const $ pure . checkFailedWrite) $ \_ -> writeToQueue q i
+
+startQueueReporting
+    :: DebugCallback
+    -> TBMQueue (IndexName, Value)
+    -> IO ()
+startQueueReporting (DebugCallback _ (Just t) delay) q =
+    void $ async $ forever $ do
+        let estimate = do
+                threadDelay delay
+                atomically $ do
+                    estimateLen <- estimateFreeSlotsTBMQueue q
+                    writeTBChan t (DSEstimateLength estimateLen)
+            true = do
+                threadDelay delay
+                atomically $ do
+                    trueLen <- freeSlotsTBMQueue q
+                    writeTBChan t (DSTrueLength trueLen)
+        replicateM_ 4 estimate
+        true
+startQueueReporting _ _ = return ()
 
 -------------------------------------------------------------------------------
 baseMapping :: MappingName -> Value
