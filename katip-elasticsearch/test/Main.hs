@@ -150,7 +150,7 @@ esTests = testGroup "elasticsearch scribe"
       withResource (newTBChanIO 1) (const $ return ()) $ \tSig' ->
       withSearchIO (\c -> do timeoutVar <- timeoutVar'
                              tSig <- tSig'
-                             return $ c { essQueueSendThreshold = BulkSend (TimeoutExt timeoutVar) $ SendThresholdCount 3
+                             return $ c { essQueueSendThreshold = BulkSend $ BulkSendCfg (TimeoutExt timeoutVar) (SendThresholdCount 3) (MicroSeconds 100)
                                         , essLoggingGuarantees = Try 5
                                         , essDebugCallback = DebugCallback (Just $ TIO.putStrLn) (Just $ tSig) 100000000
                                         , essPoolSize = ps
@@ -165,8 +165,12 @@ esTests = testGroup "elasticsearch scribe"
               atomically $ do
                 sent <- readTBChan tSig
                 unless (sent == sig) retry
+            waitForSignalIsh sigEq =
+              atomically $ do
+                sent <- readTBChan tSig
+                unless (sigEq sent) retry
             forceTimeout =
-              threadDelay 10 >> (atomically $ writeTVar timeoutVar True)
+              threadDelay 100 >> (atomically $ writeTVar timeoutVar True)
 
         withTestLogging' (set logEnvTimer (readTVarIO fakeClock)) setup $ \done -> do
           $(logT) (ExampleCtx True) mempty InfoS "today"
@@ -177,6 +181,11 @@ esTests = testGroup "elasticsearch scribe"
           liftIO $ do
             waitForSignal DSStartWait
             forceTimeout
+            waitForSignal DSFinishWait
+            waitForSignalIsh (\x -> case x of
+                             DSTimeTaken {} -> True
+                             _ -> False
+                             )
             waitForSignal $ DSSent 2
             void $ bh (refreshIndex ixn)
             todayLogs <- getLogsByIndex (IndexName "katip-elasticsearch-tests-2016-01-02")
@@ -192,6 +201,11 @@ esTests = testGroup "elasticsearch scribe"
           -- Test that a bulk configured get sent
           liftIO $ do
             waitForSignal DSStartWait
+            waitForSignal DSFinishWait
+            waitForSignalIsh (\x -> case x of
+                             DSTimeTaken {} -> True
+                             _ -> False
+                             )
             waitForSignal $ DSSent 3
             void $ bh (refreshIndex ixn)
             todayLogs <- getLogsByIndex (IndexName "katip-elasticsearch-tests-2016-01-02")
@@ -209,6 +223,11 @@ esTests = testGroup "elasticsearch scribe"
             _ <- async $ do
               waitForSignal DSStartWait
               forceTimeout
+              waitForSignal DSFinishWait
+              waitForSignalIsh (\x -> case x of
+                               DSTimeTaken {} -> True
+                               _ -> False
+                               )
             void $ done
   ]
 
