@@ -42,6 +42,7 @@ module Katip.Scribes.ElasticSearch
     , IndexNameSegment(..)
     , essQueueSendThreshold
     , QueueSendThreshold(..)
+    , BulkSendCfg(..)
     , BulkSendType(..)
     , Timeout(..)
     , Seconds(..)
@@ -88,6 +89,7 @@ import qualified Data.Text                               as T
 import qualified Data.Text.Encoding                      as T
 import           Data.Time
 import           Data.Time.Calendar.WeekDate
+import           Data.Time.Clock.POSIX
 import           Data.Typeable
 import           Data.UUID
 import qualified Data.UUID.V4                            as UUID4
@@ -275,11 +277,11 @@ splitTime t = asMins `divMod` 60
     asMins = floor t `div` 60
 
 -------------------------------------------------------------------------------
-newtype Seconds = Seconds Int
+newtype Seconds = Seconds { unSeconds :: Int }
                 deriving (Typeable)
 
 -------------------------------------------------------------------------------
-newtype MicroSeconds = MicroSeconds Int
+newtype MicroSeconds = MicroSeconds { unMicroSeconds :: Int }
                      deriving (Typeable)
 
 -------------------------------------------------------------------------------
@@ -293,9 +295,17 @@ data Timeout = Timeout Seconds MicroSeconds
 -------------------------------------------------------------------------------
 data QueueSendThreshold = SendEach
                         -- ^ Log each element using indexDocument
-                        | BulkSend !Timeout !BulkSendType
+                        | BulkSend !BulkSendCfg
                         -- ^ Use a bulk strategy when logging the document
                         deriving (Typeable)
+
+-------------------------------------------------------------------------------
+data BulkSendCfg = BulkSendCfg {
+    bscTimeout              :: !Timeout
+  , bscBulkSendType         :: !BulkSendType
+  , bscAccumulationDelay    :: !MicroSeconds
+  }
+  deriving (Typeable)
 
 -------------------------------------------------------------------------------
 data BulkSendType = SendThresholdCount !Int
@@ -313,6 +323,7 @@ data LoggingGuarantees = NoGuarantee
                        -- ^ Try using a retry policy
                        | TryAll
                        -- ^ Keep trying every millisecond to queue the message.
+                       deriving (Typeable)
 
 -------------------------------------------------------------------------------
 -- | Configures the scribe with some level of elastic search index configuration
@@ -353,6 +364,10 @@ data DebugStatus = DSSent !Int
                  -- ^ How many messages were sent
                  | DSStartWait
                  -- ^ Waiting on timeout signal
+                 | DSFinishWait
+                 -- ^ Done waiting on timeout signal
+                 | DSTimeTaken !Double
+                 -- ^ How long did we wait
                  | DSEstimateLength !Int
                  -- ^ Estimated length of this queue
                  | DSTrueLength !Int
@@ -440,21 +455,20 @@ mkEsScribe cfg@EsScribeCfg {..} env ix mapping sev verb = do
   workers <- replicateM (unEsPoolSize essPoolSize) $ async $
     case essQueueSendThreshold of
       SendEach -> report' "Starting a single log worker" >> startWorker cfg env mapping q
-      BulkSend timeout t -> report' "Starting a bulk log worker" >> startBulkWorker cfg env timeout t mapping q
+      BulkSend b -> report' "Starting a bulk log worker" >> startBulkWorker cfg env b mapping q
+
+
+  eReporter <- startQueueReporting essDebugCallback essQueueSize q
 
   _ <- async $ do
     takeMVar endSig
     atomically $ closeTBMQueue q
     mapM_ waitCatch workers
-    putMVar endSig ()
-
-
-  startQueueReporting essDebugCallback q
-
-  _ <- async $ do
-    takeMVar endSig
-    atomically $ closeTBMQueue q
-    mapM_ waitCatch workers
+    case eReporter of
+      Left _ -> return ()
+      Right reporter -> do
+        cancel reporter
+        void $ waitCatch reporter
     putMVar endSig ()
 
   let scribe = Scribe $ \ i ->
@@ -489,23 +503,25 @@ mkEsScribe cfg@EsScribeCfg {..} env ix mapping sev verb = do
 
 startQueueReporting
     :: DebugCallback
+    -> EsQueueSize
     -> TBMQueue (IndexName, Value)
-    -> IO ()
-startQueueReporting (DebugCallback _ (Just t) delay) q =
-    void $ async $ forever $ do
+    -> IO (Either () (Async ()))
+startQueueReporting (DebugCallback _ (Just t) delay) (EsQueueSize size) q =
+  let act = async $ forever $ do
         let estimate = do
-                threadDelay delay
-                atomically $ do
-                    estimateLen <- estimateFreeSlotsTBMQueue q
-                    writeTBChan t (DSEstimateLength estimateLen)
+              threadDelay delay
+              atomically $ do
+                estimateLen <- estimateFreeSlotsTBMQueue q
+                writeTBChan t (DSEstimateLength $ size - estimateLen)
             true = do
-                threadDelay delay
-                atomically $ do
-                    trueLen <- freeSlotsTBMQueue q
-                    writeTBChan t (DSTrueLength trueLen)
+              threadDelay delay
+              atomically $ do
+                trueLen <- freeSlotsTBMQueue q
+                writeTBChan t (DSTrueLength $ size - trueLen)
         replicateM_ 4 estimate
         true
-startQueueReporting _ _ = return ()
+  in Right <$> act
+startQueueReporting _ _ _ = return $ Left ()
 
 -------------------------------------------------------------------------------
 baseMapping :: MappingName -> Value
@@ -624,21 +640,31 @@ startWorker EsScribeCfg {..} env mapping q = go
         _ -> return True
     report' text = liftIO $ report essDebugCallback text
 
+timeIt :: IO a -> IO (a, Double)
+timeIt action = do
+    startTime <- getPOSIXTime
+    result <- action
+    endTime <- getPOSIXTime
+    let duration = toSeconds $ endTime - startTime
+    return (result, duration)
+
+toSeconds :: POSIXTime -> Double
+toSeconds = fromRational . toRational
+
+
 startBulkWorker
     :: EsScribeCfg
     -> BHEnv
-    -> Timeout
-    -- ^ Timeout strategy for waiting alternative to predicate
-    -> BulkSendType
+    -> BulkSendCfg
     -- ^ What is the bulking strategy
     -> MappingName
     -> TBMQueue (IndexName, Value)
     -> IO ()
-startBulkWorker EsScribeCfg {..} env timeout bulkType mapping q = do
+startBulkWorker EsScribeCfg {..} env (BulkSendCfg {..}) mapping q = do
   stopSignal <- newTVarIO False
   acc <- newTVarIO []
 
-  let popAction = tryReadTBMQueue q
+  let popAction = readTBMQueue q
   -- Start an action that will read from our queue into an accumulation
   -- variable to bulk up values
   _ <- async $ do
@@ -649,17 +675,13 @@ startBulkWorker EsScribeCfg {..} env timeout bulkType mapping q = do
             Nothing -> do
               atomically $ writeTVar stopSignal True
               return False
-            -- Reading an empty queue should continue to try reading
-            Just Nothing -> return True
             -- Accumulate the value and continue
-            Just (Just v') -> do
-              atomically $ do
-                !es <- readTVar acc
-                writeTVar acc (v':es)
+            Just v' -> do
+              atomically $ modifyTVar' acc (v':)
               return True
     -- If we have been told not to continue stop recursing
     let act' = act >>= \x -> if x
-          then yield >> act'
+          then yield >> (threadDelay $ unMicroSeconds bscAccumulationDelay) >> act'
           else return ()
     act'
 
@@ -667,9 +689,9 @@ startBulkWorker EsScribeCfg {..} env timeout bulkType mapping q = do
   go stopSignal acc
   where
     go stopSignal acc = do
-      let popPred = mkSendPredicate bulkType
+      let popPred = mkSendPredicate bscBulkSendType
 
-      timedOut <- mkTimeout timeout
+      timedOut <- mkTimeout bscTimeout
 
 
       -- Wait until the timeout is true
@@ -686,11 +708,14 @@ startBulkWorker EsScribeCfg {..} env timeout bulkType mapping q = do
       -- If we are set to debug, send a signal to the configured signal var that we are starting a wait
       signal' $ DSStartWait
       -- Wait on timeout or predicate to stop retrying, return all the accumulated values
-      popped <- atomically $ do
+      (popped, duration) <- timeIt $ atomically $ do
         waitTimeout <|> waitEls
         swapTVar acc []
       -- Cleanup the timeout
-      cancelTimeout timeout
+      cancelTimeout bscTimeout
+      -- If we are set to debug, send a signal to the configured signal var that we are finished waiting
+      signal' $ DSFinishWait
+      signal' $ DSTimeTaken duration
 
 
       -- If we have values to send, bulk them up and send them
