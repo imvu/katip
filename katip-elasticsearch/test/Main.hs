@@ -186,6 +186,10 @@ esTests = testGroup "elasticsearch scribe"
                              DSTimeTaken {} -> True
                              _ -> False
                              )
+            waitForSignalIsh (\x -> case x of
+                             DSSendTimeTaken {} -> True
+                             _ -> False
+                             )
             waitForSignal $ DSSent 2
             void $ bh (refreshIndex ixn)
             todayLogs <- getLogsByIndex (IndexName "katip-elasticsearch-tests-2016-01-02")
@@ -204,6 +208,10 @@ esTests = testGroup "elasticsearch scribe"
             waitForSignal DSFinishWait
             waitForSignalIsh (\x -> case x of
                              DSTimeTaken {} -> True
+                             _ -> False
+                             )
+            waitForSignalIsh (\x -> case x of
+                             DSSendTimeTaken {} -> True
                              _ -> False
                              )
             waitForSignal $ DSSent 3

@@ -362,6 +362,8 @@ type ReportSignal = Maybe (TBChan DebugStatus)
 -- | Reporting signal messages
 data DebugStatus = DSSent !Int
                  -- ^ How many messages were sent
+                 | DSSendTimeTaken !Double
+                 -- ^ How long did sending the bulk take
                  | DSStartWait
                  -- ^ Waiting on timeout signal
                  | DSFinishWait
@@ -720,9 +722,11 @@ startBulkWorker EsScribeCfg {..} env (BulkSendCfg {..}) mapping q = do
 
       -- If we have values to send, bulk them up and send them
       when (length popped > 0) $ do
-        let bulkOp ixn v = mkDocId >>= \did -> pure $ BulkIndex ixn mapping did v
-        bulkOps <- V.fromList <$> mapM (\(ixn, v) -> bulkOp ixn v) popped
-        sendLog bulkOps `catchAny` eat
+        (_, sendDuration) <- timeIt $ do
+          let bulkOp ixn v = mkDocId >>= \did -> pure $ BulkIndex ixn mapping did v
+          bulkOps <- V.fromList <$> mapM (\(ixn, v) -> bulkOp ixn v) popped
+          sendLog bulkOps `catchAny` eat
+        signal' $ DSSendTimeTaken sendDuration
         -- If we are set to debug, send a signal for how many items were sent
         signal' $ DSSent $ length popped
 
