@@ -150,7 +150,7 @@ esTests = testGroup "elasticsearch scribe"
       withResource (newTBChanIO 1) (const $ return ()) $ \tSig' ->
       withSearchIO (\c -> do timeoutVar <- timeoutVar'
                              tSig <- tSig'
-                             return $ c { essQueueSendThreshold = BulkSend $ BulkSendCfg (TimeoutExt timeoutVar) (SendThresholdCount 3) (MicroSeconds 100)
+                             return $ c { essQueueSendThreshold = BulkSend $ BulkSendCfg (TimeoutExt timeoutVar) (SendThresholdCount 3) (MicroSeconds 100) NoAsyncSend
                                         , essLoggingGuarantees = Try 5
                                         , essDebugCallback = DebugCallback (Just $ TIO.putStrLn) (Just $ (SignalBlock, tSig)) 100000000
                                         , essPoolSize = ps
@@ -186,6 +186,8 @@ esTests = testGroup "elasticsearch scribe"
                              DSTimeTaken {} -> True
                              _ -> False
                              )
+            waitForSignal DSStartSend
+            waitForSignal DSFinishSend
             waitForSignalIsh (\x -> case x of
                              DSSendTimeTaken {} -> True
                              _ -> False
@@ -210,6 +212,8 @@ esTests = testGroup "elasticsearch scribe"
                              DSTimeTaken {} -> True
                              _ -> False
                              )
+            waitForSignal DSStartSend
+            waitForSignal DSFinishSend
             waitForSignalIsh (\x -> case x of
                              DSSendTimeTaken {} -> True
                              _ -> False
