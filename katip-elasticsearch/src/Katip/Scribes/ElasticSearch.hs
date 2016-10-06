@@ -85,6 +85,7 @@ import           Control.Retry                           (RetryPolicy,
                                                           retrying,
                                                           recovering)
 import           Data.Aeson
+import           Data.Default
 import           Data.Monoid                             ((<>))
 import           Data.Text                               (Text)
 import qualified Data.Text                               as T
@@ -171,6 +172,9 @@ defaultEsScribeCfg = EsScribeCfg {
     , essShouldAdminES        = AdminES
     , essDebugCallback        = NoCallback
     }
+
+instance Default EsScribeCfg where
+  def = defaultEsScribeCfg
 
 -------------------------------------------------------------------------------
 -- | How should katip store your log data?
