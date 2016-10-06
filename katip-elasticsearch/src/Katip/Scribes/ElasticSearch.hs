@@ -44,6 +44,7 @@ module Katip.Scribes.ElasticSearch
     , QueueSendThreshold(..)
     , BulkSendCfg(..)
     , BulkSendType(..)
+    , ShouldSendAsync(..)
     , Timeout(..)
     , Seconds(..)
     , MicroSeconds(..)
@@ -127,7 +128,7 @@ data EsScribeCfg = EsScribeCfg {
     , essIndexSettings        :: !IndexSettings
     , essIndexSharding        :: !IndexShardingPolicy
     , essQueueSendThreshold   :: !QueueSendThreshold
-    -- ^ Configures how logs should be batched
+    -- ^ Configures how and if logs should be batched
     , essLoggingGuarantees    :: !LoggingGuarantees
     -- ^ What kind of guarantee is made that a log message will be queued
     , essShouldAdminES        :: !ShouldAdminES
@@ -279,11 +280,11 @@ splitTime t = asMins `divMod` 60
 
 -------------------------------------------------------------------------------
 newtype Seconds = Seconds { unSeconds :: Int }
-                deriving (Typeable)
+                deriving (Eq, Show, Typeable)
 
 -------------------------------------------------------------------------------
 newtype MicroSeconds = MicroSeconds { unMicroSeconds :: Int }
-                     deriving (Typeable)
+                     deriving (Eq, Show, Typeable)
 
 -------------------------------------------------------------------------------
 -- | Configurable timeout for bulk sending
@@ -294,6 +295,7 @@ data Timeout = Timeout Seconds MicroSeconds
              deriving (Typeable)
 
 -------------------------------------------------------------------------------
+-- | Configurable timeout for bulk sending
 data QueueSendThreshold = SendEach
                         -- ^ Log each element using indexDocument
                         | BulkSend !BulkSendCfg
@@ -301,10 +303,21 @@ data QueueSendThreshold = SendEach
                         deriving (Typeable)
 
 -------------------------------------------------------------------------------
+data ShouldSendAsync = YesAsyncSend
+                     | NoAsyncSend
+                     deriving (Show, Eq, Typeable)
+
+-------------------------------------------------------------------------------
+-- | Configuration of a bulk sender
 data BulkSendCfg = BulkSendCfg {
     bscTimeout              :: !Timeout
+  -- ^ Maximum wait time for send strategy. Also max time between sending logs to elastic search
   , bscBulkSendType         :: !BulkSendType
+  -- ^ Strategy for bulking up messages
   , bscAccumulationDelay    :: !MicroSeconds
+  -- ^ How long should the message accumulation thread wait in between message acculations
+  , bscSendAsync            :: !ShouldSendAsync
+  -- ^ Should sending to elasticsearch be asynchronous
   }
   deriving (Typeable)
 
@@ -354,20 +367,28 @@ data DebugCallback = DebugCallback { unReportFn :: ReportFn
                    -- ^ Configure no callback
                    deriving (Typeable)
 
+-------------------------------------------------------------------------------
 -- | Alias for a reporting function
 type ReportFn = Maybe (T.Text -> IO ())
 
+-------------------------------------------------------------------------------
 -- | Should signals block
 data ShouldSignalBlock = SignalBlock
                        | SignalNoBlock
                        deriving (Eq, Typeable)
 
+-------------------------------------------------------------------------------
 -- | Alias for a reporting signal
 type ReportSignal = Maybe (ShouldSignalBlock, TBChan DebugStatus)
 
+-------------------------------------------------------------------------------
 -- | Reporting signal messages
 data DebugStatus = DSSent !Int
                  -- ^ How many messages were sent
+                 | DSStartSend
+                 -- ^ Signal that we started a send to es
+                 | DSFinishSend
+                 -- ^ Finished a send to es
                  | DSSendTimeTaken !Double
                  -- ^ How long did sending the bulk take
                  | DSStartWait
@@ -423,6 +444,7 @@ signal
 signal (DebugCallback _ (Just s) _) i = atomically $ signalWrite s i
 signal _ _ = pure ()
 
+-------------------------------------------------------------------------------
 signalWrite
     :: (ShouldSignalBlock, TBChan DebugStatus)
     -> DebugStatus
@@ -517,6 +539,7 @@ mkEsScribe cfg@EsScribeCfg {..} env ix mapping sev verb = do
 
     retryWrite retryPolicy q i = retrying retryPolicy (const $ pure . checkFailedWrite) $ \_ -> writeToQueue q i
 
+-------------------------------------------------------------------------------
 startQueueReporting
     :: DebugCallback
     -> EsQueueSize
@@ -627,6 +650,29 @@ cancelTimeout (Timeout _ _) = return ()
 cancelTimeout (TimeoutExt t) = atomically $ writeTVar t False
 
 -------------------------------------------------------------------------------
+sendAsync
+  :: ShouldSendAsync
+  -> IO ()
+  -> IO ()
+sendAsync YesAsyncSend a = void $ async a
+sendAsync NoAsyncSend a = a
+
+-------------------------------------------------------------------------------
+timeIt :: IO a -> IO (a, Double)
+timeIt action = do
+    startTime <- getPOSIXTime
+    result <- action
+    endTime <- getPOSIXTime
+    let duration = toSeconds $ endTime - startTime
+    return (result, duration)
+
+-------------------------------------------------------------------------------
+toSeconds :: POSIXTime -> Double
+toSeconds = fromRational . toRational
+
+
+
+-------------------------------------------------------------------------------
 startWorker
     :: EsScribeCfg
     -> BHEnv
@@ -639,7 +685,12 @@ startWorker EsScribeCfg {..} env mapping q = go
       popped <- atomically $ readTBMQueue q
       case popped of
         Just (ixn, v) -> do
-          sendLog ixn v `catchAny` eat
+          signal' DSStartSend
+          (_, sendDuration) <- timeIt $ sendLog ixn v `catchAny` eat
+          signal' DSFinishSend
+          signal' $ DSSendTimeTaken sendDuration
+          signal' $ DSSent 1
+
           go
         Nothing -> do
           report' "Single Logger closing"
@@ -654,19 +705,9 @@ startWorker EsScribeCfg {..} env mapping q = go
       case fromException e of
         Just (_ :: AsyncException) -> return False
         _ -> return True
+
     report' text = liftIO $ report essDebugCallback text
-
-timeIt :: IO a -> IO (a, Double)
-timeIt action = do
-    startTime <- getPOSIXTime
-    result <- action
-    endTime <- getPOSIXTime
-    let duration = toSeconds $ endTime - startTime
-    return (result, duration)
-
-toSeconds :: POSIXTime -> Double
-toSeconds = fromRational . toRational
-
+    signal' i = liftIO $ signal essDebugCallback i
 
 startBulkWorker
     :: EsScribeCfg
@@ -722,7 +763,7 @@ startBulkWorker EsScribeCfg {..} env (BulkSendCfg {..}) mapping q = do
             when cont $ retry
 
       -- If we are set to debug, send a signal to the configured signal var that we are starting a wait
-      signal' $ DSStartWait
+      signal' DSStartWait
       -- Wait on timeout or predicate to stop retrying, return all the accumulated values
       (popped, duration) <- timeIt $ atomically $ do
         waitTimeout <|> waitEls
@@ -730,19 +771,22 @@ startBulkWorker EsScribeCfg {..} env (BulkSendCfg {..}) mapping q = do
       -- Cleanup the timeout
       cancelTimeout bscTimeout
       -- If we are set to debug, send a signal to the configured signal var that we are finished waiting
-      signal' $ DSFinishWait
+      signal' DSFinishWait
       signal' $ DSTimeTaken duration
 
 
       -- If we have values to send, bulk them up and send them
       when (length popped > 0) $ do
-        (_, sendDuration) <- timeIt $ do
-          let bulkOp ixn v = mkDocId >>= \did -> pure $ BulkIndex ixn mapping did v
-          bulkOps <- V.fromList <$> mapM (\(ixn, v) -> bulkOp ixn v) popped
-          sendLog bulkOps `catchAny` eat
-        signal' $ DSSendTimeTaken sendDuration
-        -- If we are set to debug, send a signal for how many items were sent
-        signal' $ DSSent $ length popped
+        sendAsync bscSendAsync $ do
+          signal' DSStartSend
+          (_, sendDuration) <- timeIt $ do
+            let bulkOp ixn v = mkDocId >>= \did -> pure $ BulkIndex ixn mapping did v
+            bulkOps <- V.fromList <$> mapM (\(ixn, v) -> bulkOp ixn v) popped
+            sendLog bulkOps `catchAny` eat
+          signal' DSFinishSend
+          signal' $ DSSendTimeTaken sendDuration
+          -- If we are set to debug, send a signal for how many items were sent
+          signal' $ DSSent $ length popped
 
       -- Is the queue closed?
       stop <- atomically $ readTVar stopSignal
