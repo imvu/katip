@@ -3,6 +3,7 @@
 {-# LANGUAGE OverloadedStrings   #-}
 {-# LANGUAGE RankNTypes          #-}
 {-# LANGUAGE RecordWildCards     #-}
+{-# LANGUAGE RecursiveDo     #-}
 {-# LANGUAGE ScopedTypeVariables #-}
 -- | Includes a scribe that can be used to log structured, JSON log
 -- messages to ElasticSearch. These logs can be explored easily using
@@ -86,7 +87,10 @@ import           Control.Retry                           (RetryPolicy,
                                                           recovering)
 import           Data.Aeson
 import           Data.Default
+import qualified Data.Foldable                           as F
+import qualified Data.HashMap.Strict                     as HM
 import           Data.Monoid                             ((<>))
+import qualified Data.Sequence                           as Seq
 import           Data.Text                               (Text)
 import qualified Data.Text                               as T
 import qualified Data.Text.Encoding                      as T
@@ -94,6 +98,7 @@ import           Data.Time
 import           Data.Time.Calendar.WeekDate
 import           Data.Time.Clock.POSIX
 import           Data.Typeable
+import qualified Data.Unique.Really                      as Unique
 import           Data.UUID
 import qualified Data.UUID.V4                            as UUID4
 import qualified Data.Vector                             as V
@@ -328,7 +333,7 @@ data BulkSendCfg = BulkSendCfg {
 -------------------------------------------------------------------------------
 data BulkSendType = SendThresholdCount !Int
                   -- ^ Simple count threshold for bulk sending. Try to get up to the number of log elements to send
-                  | SendThresholdPredicate ([(IndexName,Value)] -> Bool)
+                  | SendThresholdPredicate (Seq.Seq (IndexName,Value) -> Bool)
                   -- ^ User provided predicate for how to determine when to stop accumulating log elements for bulk sending
                   deriving (Typeable)
 
@@ -405,6 +410,8 @@ data DebugStatus = DSSent !Int
                  -- ^ Estimated length of this queue
                  | DSTrueLength !Int
                  -- ^ True length of this queue
+                 | DSAsyncRequestsInFlight !Int
+                 -- ^ How many async requests are in flight
                  deriving (Eq, Typeable)
 
 
@@ -458,6 +465,14 @@ signalWrite (sb, s) i = case sb of
   SignalNoBlock -> void $ tryWriteTBChan s i
 
 -------------------------------------------------------------------------------
+signalAct
+    :: DebugCallback
+    -> ((ShouldSignalBlock, TBChan DebugStatus) -> IO ())
+    -> IO ()
+signalAct (DebugCallback _ (Just s) _) act = act s
+signalAct _ _ = pure ()
+
+-------------------------------------------------------------------------------
 mkEsScribe
     :: EsScribeCfg
     -> BHEnv
@@ -493,11 +508,23 @@ mkEsScribe cfg@EsScribeCfg {..} env ix mapping sev verb = do
               liftIO $ throwIO (CouldNotCreateMapping r2)
           else liftIO $ throwIO IndexDoesNotExist
 
+
+  senders <- newTVarIO HM.empty
+  case essQueueSendThreshold of
+    BulkSend b -> do
+      when (bscSendAsync b == YesAsyncSend) $
+        void $ signalAct essDebugCallback $ \_ -> do
+          void $ async $ forever $ do
+            threadDelay 1000000
+            numInFlight <- length <$> (atomically $ readTVar senders)
+            signal' $ DSAsyncRequestsInFlight $ numInFlight
+    _ -> return ()
+
   report' $ "Making workers: count(" <> (T.pack $ show essPoolSize) <> ")"
   workers <- replicateM (unEsPoolSize essPoolSize) $ async $
     case essQueueSendThreshold of
       SendEach -> report' "Starting a single log worker" >> startWorker cfg env mapping q
-      BulkSend b -> report' "Starting a bulk log worker" >> startBulkWorker cfg env b mapping q
+      BulkSend b -> report' "Starting a bulk log worker" >> startBulkWorker cfg env b senders mapping q
 
 
   eReporter <- startQueueReporting essDebugCallback essQueueSize q
@@ -520,6 +547,8 @@ mkEsScribe cfg@EsScribeCfg {..} env ix mapping sev verb = do
   return (scribe, finalizer)
   where
     report' text = liftIO $ report essDebugCallback text
+    signal' i = liftIO $ signal essDebugCallback i
+
     tplName = TemplateName ixn
     shardingEnabled = case essIndexSharding of
       NoIndexSharding -> False
@@ -655,11 +684,15 @@ cancelTimeout (TimeoutExt t) = atomically $ writeTVar t False
 
 -------------------------------------------------------------------------------
 sendAsync
-  :: ShouldSendAsync
+  :: TVar (HM.HashMap Unique.Unique (Async ()))
+  -> ShouldSendAsync
+  -> (Unique.Unique -> IO ())
   -> IO ()
-  -> IO ()
-sendAsync YesAsyncSend a = void $ async a
-sendAsync NoAsyncSend a = a
+sendAsync senders YesAsyncSend a = do
+  unique <- Unique.newUnique
+  rec { asyncRef <- async $ (atomically $ modifyTVar' senders $ HM.insert unique asyncRef) >> a unique }
+  return ()
+sendAsync _ NoAsyncSend a = a =<< Unique.newUnique
 
 -------------------------------------------------------------------------------
 timeIt :: IO a -> IO (a, Double)
@@ -713,19 +746,27 @@ startWorker EsScribeCfg {..} env mapping q = go
     report' text = liftIO $ report essDebugCallback text
     signal' i = liftIO $ signal essDebugCallback i
 
+data BulkWorkerState = BulkWorkerState {
+    bwsStopSignal :: TVar Bool
+  , bwsAcc        :: TVar (Seq.Seq (IndexName, Value))
+  , bwsSenders    :: TVar (HM.HashMap Unique.Unique (Async ()))
+  }
+
 startBulkWorker
     :: EsScribeCfg
     -> BHEnv
     -> BulkSendCfg
     -- ^ What is the bulking strategy
+    -> TVar (HM.HashMap Unique.Unique (Async ()))
     -> MappingName
     -> TBMQueue (IndexName, Value)
     -> IO ()
-startBulkWorker EsScribeCfg {..} env (BulkSendCfg {..}) mapping q = do
-  stopSignal <- newTVarIO False
-  acc <- newTVarIO []
+startBulkWorker EsScribeCfg {..} env (BulkSendCfg {..}) senders mapping q = do
+  bwsStopSignal <- newTVarIO False
+  bwsAcc <- newTVarIO Seq.empty
 
   let popAction = readTBMQueue q
+      bwsSenders = senders
   -- Start an action that will read from our queue into an accumulation
   -- variable to bulk up values
   _ <- async $ do
@@ -734,11 +775,11 @@ startBulkWorker EsScribeCfg {..} env (BulkSendCfg {..}) mapping q = do
           case v of
             -- If the queue has been closed and is empty we want to signal that its all over
             Nothing -> do
-              atomically $ writeTVar stopSignal True
+              atomically $ writeTVar bwsStopSignal True
               return False
             -- Accumulate the value and continue
             Just v' -> do
-              atomically $ modifyTVar' acc (v':)
+              atomically $ modifyTVar' bwsAcc (v' Seq.<|)
               return True
     -- If we have been told not to continue stop recursing
     let act' = act >>= \x -> if x
@@ -746,10 +787,11 @@ startBulkWorker EsScribeCfg {..} env (BulkSendCfg {..}) mapping q = do
           else return ()
     act'
 
+
   -- Start the recursive worker
-  go stopSignal acc
+  go BulkWorkerState {..}
   where
-    go stopSignal acc = do
+    go b@(BulkWorkerState {..}) = do
       let popPred = mkSendPredicate bscBulkSendType
 
       timedOut <- mkTimeout bscTimeout
@@ -762,7 +804,7 @@ startBulkWorker EsScribeCfg {..} env (BulkSendCfg {..}) mapping q = do
 
       -- Wait until the predicate is false
       let waitEls = do
-            es <- readTVar acc
+            es <- readTVar bwsAcc
             let cont = popPred es
             when cont $ retry
 
@@ -771,7 +813,7 @@ startBulkWorker EsScribeCfg {..} env (BulkSendCfg {..}) mapping q = do
       -- Wait on timeout or predicate to stop retrying, return all the accumulated values
       (popped, duration) <- timeIt $ atomically $ do
         waitTimeout <|> waitEls
-        swapTVar acc []
+        swapTVar bwsAcc Seq.empty
       -- Cleanup the timeout
       cancelTimeout bscTimeout
       -- If we are set to debug, send a signal to the configured signal var that we are finished waiting
@@ -781,25 +823,26 @@ startBulkWorker EsScribeCfg {..} env (BulkSendCfg {..}) mapping q = do
 
       -- If we have values to send, bulk them up and send them
       when (length popped > 0) $ do
-        sendAsync bscSendAsync $ do
+        sendAsync bwsSenders bscSendAsync $ \unique -> do
           signal' DSStartSend
           (_, sendDuration) <- timeIt $ do
             let bulkOp ixn v = mkDocId >>= \did -> pure $ BulkIndex ixn mapping did v
-            bulkOps <- V.fromList <$> mapM (\(ixn, v) -> bulkOp ixn v) popped
+            bulkOps <- (V.fromList . F.toList) <$> mapM (\(ixn, v) -> bulkOp ixn v) popped
             sendLog bulkOps `catchAny` eat
           signal' DSFinishSend
           signal' $ DSSendTimeTaken sendDuration
           -- If we are set to debug, send a signal for how many items were sent
           signal' $ DSSent $ length popped
+          atomically $ modifyTVar' bwsSenders $ HM.delete unique
 
       -- Is the queue closed?
-      stop <- atomically $ readTVar stopSignal
+      stop <- atomically $ readTVar bwsStopSignal
 
       if stop
         then do
           report' "Bulk Logger closing"
           pure ()
-        else go stopSignal acc
+        else go b
 
     sendLog :: V.Vector BulkOperation -> IO ()
     sendLog ops = void $ recovering essRetryPolicy [handler] $ const $ do
@@ -816,7 +859,7 @@ startBulkWorker EsScribeCfg {..} env (BulkSendCfg {..}) mapping q = do
 
 mkSendPredicate
     :: BulkSendType
-    -> [(IndexName, Value)]
+    -> Seq.Seq (IndexName, Value)
     -> Bool
 mkSendPredicate (SendThresholdCount i) = go
   where
