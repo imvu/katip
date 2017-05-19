@@ -44,7 +44,7 @@ getKeys verb a = concat (renderPair A.<$> HM.toList (payloadObject verb a))
 
 -------------------------------------------------------------------------------
 data ColorStrategy
-    = ColorLog Bool
+    = ColorLog ColorRequested
     -- ^ Whether to use color control chars in log output
     | ColorIfTerminal
     -- ^ Color if output is a terminal
@@ -53,6 +53,18 @@ data ColorStrategy
 data WorkerCmd =
     NewItem Builder
   | PoisonPill
+
+type LogFormatter
+  = forall a. (LogItem a => ColorRequested -> Verbosity -> Item a -> Builder)
+
+data ColorRequested
+  = ColorEnabled
+  | ColorDisabled
+  deriving Eq
+
+toColorRequested :: Bool -> ColorRequested
+toColorRequested True = ColorEnabled
+toColorRequested False = ColorDisabled
 
 -------------------------------------------------------------------------------
 -- | Logs to a file handle such as stdout, stderr, or a file. Contexts
@@ -64,17 +76,17 @@ data WorkerCmd =
 -- > [2016-05-11 21:01:15][MyApp][Info][myhost.example.com][1724][ThreadId 1154][main:Helpers.Logging Helpers/Logging.hs:43:7] Namespace and context are back to normal
 --
 -- Returns the newly-created `Scribe` together with a finaliser the user needs to run to perform resource cleanup.
-mkHandleScribe :: ColorStrategy -> Handle -> Severity -> Verbosity -> IO (Scribe, IO ())
-mkHandleScribe cs h sev verb = do
+mkHandleScribe :: ColorStrategy -> LogFormatter -> Handle -> Severity -> Verbosity -> IO (Scribe, IO ())
+mkHandleScribe cs fmt h sev verb = do
   (inChan, outChan) <- U.newChan 4096
   worker <- async $ workerLoop outChan
   flip onException (stopWorker worker inChan) $ do
     hSetBuffering h LineBuffering
     colorize <- case cs of
-      ColorIfTerminal -> hIsTerminalDevice h
+      ColorIfTerminal -> toColorRequested <$> hIsTerminalDevice h
       ColorLog b -> return b
     let scribe = Scribe $ \i ->
-          when (permitItem sev i) $ void (U.tryWriteChan inChan (NewItem (formatItem colorize verb i)))
+          when (permitItem sev i) $ void (U.tryWriteChan inChan (NewItem (fmt colorize verb i)))
     return (scribe, stopWorker worker inChan)
 
   where
@@ -93,7 +105,7 @@ mkHandleScribe cs h sev verb = do
         PoisonPill -> return ()
 
 -------------------------------------------------------------------------------
-formatItem :: LogItem a => Bool -> Verbosity -> Item a -> Builder
+formatItem :: LogItem a => ColorRequested -> Verbosity -> Item a -> Builder
 formatItem withColor verb Item{..} =
     brackets nowStr <>
     brackets (mconcat $ map fromText $ intercalateNs _itemNamespace) <>
@@ -117,7 +129,7 @@ formatItem withColor verb Item{..} =
     red = colorize "31"
     yellow = colorize "33"
     colorize c s
-      | withColor = "\ESC["<> c <> "m" <> s <> "\ESC[0m"
+      | withColor == ColorEnabled = "\ESC["<> c <> "m" <> s <> "\ESC[0m"
       | otherwise = s
 
 
@@ -127,7 +139,7 @@ formatItem withColor verb Item{..} =
 _ioLogEnv :: LogEnv
 _ioLogEnv = unsafePerformIO $ do
     le <- initLogEnv "io" "io"
-    (lh, _) <- mkHandleScribe ColorIfTerminal stdout DebugS V3
+    (lh, _) <- mkHandleScribe ColorIfTerminal formatItem stdout DebugS V3
     return $ registerScribe "stdout" lh le
 {-# NOINLINE _ioLogEnv #-}
 
