@@ -105,7 +105,7 @@ mkHandleScribe cs fmt h sev verb = do
         PoisonPill -> return ()
 
 -------------------------------------------------------------------------------
-formatItem :: LogItem a => ColorRequested -> Verbosity -> Item a -> Builder
+formatItem :: LogFormatter
 formatItem withColor verb Item{..} =
     brackets nowStr <>
     brackets (mconcat $ map fromText $ intercalateNs _itemNamespace) <>
